@@ -30,8 +30,8 @@ except Exception:
     _HAS_SENTENCE_TRANSFORMERS = False
 
 try:
-    from PySide6.QtCore import Qt, QTimer, Signal, QThread, QMimeData
-    from PySide6.QtGui import QAction, QDrag
+    from PySide6.QtCore import Qt, QTimer, Signal, QThread, QMimeData, Qsize
+    from PySide6.QtGui import QAction, QDrag, QtextDocument
     from PySide6.QtWidgets import (
         QApplication,
         QWidget,
@@ -52,6 +52,7 @@ try:
         QListWidgetItem,
         QFrame,
         QSizePolicy,
+        QTextBrowser
     )
     _HAS_QT = True
 except Exception:
@@ -280,6 +281,7 @@ MEMORY_DIR = os.path.join(pathlib.Path.home(), ".AtlasAI")
 CHAT_LOG_DIR = os.path.join(MEMORY_DIR, "chats")
 MEMORY_FILE = os.path.join(MEMORY_DIR, "memory.jsonl")
 CHAT_LOG_FILE = os.path.join(MEMORY_DIR, "chat_history.jsonl")
+WORKSPACE_CONFIG_FILE = os.path.join(MEMORY_DIR, "workspace.json")
 MODEL_SEARCH_DIR = os.path.expanduser("~/Documents/Ai_Models/")
 EMBED_MODEL = "all-MiniLM-L6-v2"
 EMBED_DIM = 384
@@ -377,6 +379,7 @@ PROMPT_TEMPLATE = (
     "{recent_section}"
     "{instructions_section}"
     "{tools_section}"
+    "{workspace_section}"
     "User request:\n{user}\n\n"
     "{web_section}"
     "Assistant:\n"
@@ -536,6 +539,160 @@ def simple_embedding(text: str) -> np.ndarray:
     if norm > 0:
         vec /= norm
     return vec
+
+class WorkspaceManager:
+    """Lazy, on-demand filesystem access for a user-chosen root directory."""
+
+    MAX_FILE_CHARS   = 8_000
+    MAX_TREE_ENTRIES = 200
+    TEXT_EXTENSIONS = {
+        ".txt", ".md", ".markdown", ".py", ".js", ".ts", ".jsx", ".tsx",
+        ".html", ".htm", ".css", ".scss", ".json", ".jsonl", ".yaml", ".yml",
+        ".toml", ".ini", ".cfg", ".conf", ".env", ".sh", ".bash", ".zsh",
+        ".fish", ".rs", ".go", ".c", ".cpp", ".h", ".hpp", ".java", ".kt",
+        ".rb", ".php", ".cs", ".swift", ".lua", ".r", ".sql", ".xml",
+        ".csv", ".log", ".rst", ".tex", ".makefile", ".dockerfile", "",
+    }
+
+    def __init__(self, config_path: str = WORKSPACE_CONFIG_FILE):
+        self.config_path = config_path
+        self.root: Optional[str] = None
+        self._load()
+
+    def _load(self) -> None:
+        if not os.path.exists(self.config_path):
+            return
+        try:
+            with open(self.config_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            root = data.get("root", "")
+            if root and os.path.isdir(root):
+                self.root = root
+        except Exception:
+            pass
+
+    def _save(self) -> None:
+        os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+        try:
+            with open(self.config_path, "w", encoding="utf-8") as fh:
+                json.dump({"root": self.root or ""}, fh)
+        except Exception:
+            pass
+
+    def set_root(self, path: str) -> str:
+        path = os.path.expanduser(path.strip())
+        if not os.path.isdir(path):
+            return f"✗ Not a directory: {path}"
+        self.root = path
+        self._save()
+        return f"✓ Workspace set to: {path}"
+
+    def clear(self) -> str:
+        self.root = None
+        self._save()
+        return "Workspace cleared."
+
+    def status(self) -> str:
+        if self.root:
+            return f"Workspace root: {self.root}"
+        return "No workspace set. Use !workspace <path> to set one."
+
+    def tree(self, max_entries: int = MAX_TREE_ENTRIES) -> str:
+        if not self.root:
+            return "No workspace set."
+        lines: List[str] = [f"Workspace: {self.root}"]
+        count = 0
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in sorted(dirnames) if not d.startswith(".")]
+            rel_dir = os.path.relpath(dirpath, self.root)
+            depth = 0 if rel_dir == "." else rel_dir.count(os.sep) + 1
+            indent = "  " * depth
+            folder_name = os.path.basename(dirpath) if rel_dir != "." else "."
+            lines.append(f"{indent}📁 {folder_name}/")
+            for fname in sorted(filenames):
+                if fname.startswith("."):
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in self.TEXT_EXTENSIONS:
+                    continue
+                lines.append(f"{indent}  {fname}")
+                count += 1
+                if count >= max_entries:
+                    lines.append(f"  … (truncated at {max_entries} entries)")
+                    return "\n".join(lines)
+        return "\n".join(lines)
+
+    def read_file(self, rel_or_abs: str) -> Tuple[str, str]:
+        if not self.root:
+            return "", "No workspace set."
+        path = rel_or_abs.strip()
+        if not os.path.isabs(path):
+            path = os.path.join(self.root, path)
+        try:
+            resolved = os.path.realpath(path)
+            root_resolved = os.path.realpath(self.root)
+            if not resolved.startswith(root_resolved + os.sep) and resolved != root_resolved:
+                return "", "Access denied: path is outside workspace root."
+        except Exception:
+            return "", "Could not resolve path."
+        if not os.path.isfile(resolved):
+            return "", f"File not found: {resolved}"
+        ext = os.path.splitext(resolved)[1].lower()
+        if ext not in self.TEXT_EXTENSIONS:
+            return "", f"Binary file skipped: {os.path.basename(resolved)}"
+        try:
+            with open(resolved, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read(self.MAX_FILE_CHARS)
+            truncated = os.path.getsize(resolved) > self.MAX_FILE_CHARS
+            note = f"\n… [truncated at {self.MAX_FILE_CHARS} chars]" if truncated else ""
+            return content + note, ""
+        except Exception as exc:
+            return "", f"Read error: {exc}"
+
+    def find_relevant_files(self, query: str, max_files: int = 3) -> List[Tuple[str, str]]:
+        if not self.root:
+            return []
+        query_lower = query.lower()
+        terms = [re.sub(r"[^\w]", "", w) for w in query_lower.split() if len(w) > 3]
+        if not terms:
+            return []
+        matches: List[Tuple[int, str]] = []
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+            for fname in filenames:
+                if fname.startswith("."):
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in self.TEXT_EXTENSIONS:
+                    continue
+                abs_path = os.path.join(dirpath, fname)
+                rel_path = os.path.relpath(abs_path, self.root)
+                combined = (fname + " " + rel_path).lower()
+                score = sum(1 for t in terms if t in combined)
+                if score > 0:
+                    matches.append((score, abs_path))
+        matches.sort(reverse=True, key=lambda x: x[0])
+        results = []
+        for _, abs_path in matches[:max_files]:
+            content, err = self.read_file(abs_path)
+            if content:
+                rel = os.path.relpath(abs_path, self.root)
+                results.append((rel, content))
+        return results
+
+    def prompt_section(self, query: str) -> str:
+        if not self.root:
+            return ""
+        relevant = self.find_relevant_files(query)
+        if not relevant:
+            return f"WORKSPACE ROOT: {self.root}\n(No files matched query — use !workspace read <file> to load one.)\n\n"
+        parts = [f"WORKSPACE ROOT: {self.root}"]
+        for rel_path, content in relevant:
+            parts.append(f"\n--- FILE: {rel_path} ---\n{content}\n--- END FILE ---")
+        parts.append("")
+        return "\n".join(parts) + "\n"
+
+
 
 def extract_json_text(text: str) -> str:
     """
@@ -708,6 +865,7 @@ class AtlasAI:
     def __init__(self, model_path: Optional[str] = None, memory_path: str = MEMORY_FILE):
         self.model_path = model_path
         self.memory = MemoryStore(memory_path)
+        self.workspace = WorkspaceManager()
         self.history: List[Dict[str, str]] = []
         self.chat_filename: Optional[str] = None
         self.last_prompt = ""
@@ -988,6 +1146,27 @@ class AtlasAI:
             return self.load_model(model_path)
         if lowered in ("!loadmodel", "!model"):
             return "Usage: !loadmodel /path/to/model.gguf"
+        # Workspace commands
+        if lowered == "!workspace":
+            return self.workspace.status()
+        if lowered.startswith("!workspace set "):
+            path = user[len("!workspace set "):].strip()
+            return self.workspace.set_root(path)
+        if lowered.startswith("!workspace ") and not lowered.startswith("!workspace read") and not lowered.startswith("!workspace tree") and not lowered.startswith("!workspace clear") and not lowered.startswith("!workspace set"):
+            # bare: !workspace /some/path
+            path = user[len("!workspace "):].strip()
+            if path and not path.startswith("!"):
+                return self.workspace.set_root(path)
+        if lowered == "!workspace tree":
+            return self.workspace.tree()
+        if lowered == "!workspace clear":
+            return self.workspace.clear()
+        if lowered.startswith("!workspace read "):
+            rel = user[len("!workspace read "):].strip()
+            content, err = self.workspace.read_file(rel)
+            if err:
+                return f"✗ {err}"
+            return f"--- {rel} ---\n{content}\n--- end ---"
         return None
 
     def _print_startup_info(self) -> None:
@@ -1028,6 +1207,7 @@ class AtlasAI:
         tools = load_markdown_file(DEFAULT_TOOLS_FILENAME)
         instructions_section = "Instructions file:\n" + instructions + "\n\n" if instructions else ""
         tools_section = "Tools file:\n" + tools + "\n\n" if tools else ""
+        workspace_section = self.workspace.prompt_section(user)
         web_section = ""
         if web_summary or web_sources:
             web_section = "Web search summary:\n" + web_summary.strip() + "\n\n"
@@ -1042,6 +1222,7 @@ class AtlasAI:
             recent_section=recent_section,
             instructions_section=instructions_section,
             tools_section=tools_section,
+            workspace_section=workspace_section,
         )
 
     def _memory_snapshot_for_prompt(self) -> str:
@@ -1128,7 +1309,7 @@ class AtlasAI:
                 top_p=0.92,
                 repeat_penalty=1.2,
                 stop=["\nUser:", "\nAssistant:"],
-                stream=False,
+                stream=True,
             )
 
             try:
@@ -1448,21 +1629,26 @@ class AtlasAI:
             self.history.append({"role": "assistant", "message": answer})
             self.add_memory_if_relevant(user, answer)
             self.save_chat_history()
+            self._current_stream_bubble = None
 
     def _print_help(self) -> str:
         return (
             "Commands:\n"
-            "  !help         Show this command list\n"
-            "  !memory       Show recent memory entries\n"
-            "  !clear        Clear all saved memory\n"
-            "  !remember X   Save a note to memory\n"
-            "  !savechat X   Save the full chat history to disk under name X\n"
-            "  !loadchat X   Load a saved chat by name\n"
-            "  !listchats    List all saved chats\n"
-            "  !chatlog      Show saved chat log location\n"
-            "  !loadmodel X  Load a new GGUF model at runtime\n"
-            "  !model X      Alias for !loadmodel\n"
-            "  !exit         Quit the assistant\n"
+            "  !help              Show this command list\n"
+            "  !memory            Show recent memory entries\n"
+            "  !clear             Clear all saved memory\n"
+            "  !remember X        Save a note to memory\n"
+            "  !savechat X        Save the full chat history to disk under name X\n"
+            "  !loadchat X        Load a saved chat by name\n"
+            "  !listchats         List all saved chats\n"
+            "  !chatlog           Show saved chat log location\n"
+            "  !loadmodel X       Load a new GGUF model at runtime\n"
+            "  !model X           Alias for !loadmodel\n"
+            "  !workspace <path>  Set workspace root directory (persisted)\n"
+            "  !workspace tree    Show file tree of current workspace\n"
+            "  !workspace read X  Read a file from the workspace into chat\n"
+            "  !workspace clear   Unset the current workspace\n"
+            "  !exit              Quit the assistant\n"
         )
 
     def _render_markdown_for_gui(self, text: str) -> str:
@@ -1859,92 +2045,306 @@ if _HAS_QT:
 
             self.status_label.setText(f"{len(scored)} engrams — sorted by relevance score")
 
+def render_markdown_to_html(text: str) -> str:
+    """A safe, lightweight converter turning raw markdown into clean HTML."""
+    # Escape raw HTML syntax characters to prevent breaks
+    src = html.escape(text)
+    
+    # 1. Block level - Code blocks (```code```)
+    src = re.sub(
+        r"```([\s\S]*?)```", 
+        r'<div style="background-color: #1E1E1E; color: #D4D4D4; font-family: monospace; padding: 8px; border-radius: 6px; margin: 4px 0;">\1</div>', 
+        src
+    )
+    
+    # 2. Inline structures - Bold, Italic, Code ticks
+    src = re.sub(r"\*\*(.*?)\*\*", r"<b>\1</b>", src)
+    src = re.sub(r"\*(.*?)\*", r"<i>\1</i>", src)
+    src = re.sub(r"`(.*?)`", r'<code style="font-family: monospace; background-color: rgba(0,0,0,0.08); padding: 2px 4px; border-radius: 4px;">\1</code>', src)
+    
+    # 3. Handle structure lists and linebreaks
+    src = src.replace("\n", "<br>")
+    return src
+
+
+class MarkdownChatBubble(QWidget):
+    def __init__(self, text: str, is_user: bool = False, parent=None):
+        super().__init__(parent)
+        self.is_user = is_user
+
+        # Horizontal layout alignment wrapper
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(10, 4, 10, 4)
+
+        # Main bubble frame
+        self.bubble = QFrame()
+        
+        # Style layout profiles based on role 
+        if is_user:
+            # User profile (Aligned right, dark slate background)
+            self.bubble.setStyleSheet("""
+                QFrame {
+                    background-color: #2D3748;
+                    border-radius: 14px;
+                    border-bottom-right-radius: 2px;
+                }
+            """)
+            text_color = "#FFFFFF"
+            layout.addStretch(1)
+            layout.addWidget(self.bubble)
+        else:
+            # Assistant profile (Aligned left, clean ash background)
+            self.bubble.setStyleSheet("""
+                QFrame {
+                    background-color: #EDF2F7;
+                    border-radius: 14px;
+                    border-bottom-left-radius: 2px;
+                }
+            """)
+            text_color = "#1A202C"
+            layout.addWidget(self.bubble)
+            layout.addStretch(1)
+
+        # Bubble internal padding layout
+        bubble_layout = QVBoxLayout(self.bubble)
+        bubble_layout.setContentsMargins(12, 8, 12, 8)
+
+        # QTextBrowser acts as our Markdown render viewport
+        self.browser = QTextBrowser()
+        self.browser.setOpenExternalLinks(True)
+        self.browser.setUndoRedoEnabled(False)
+        self.browser.setReadOnly(True)
+        
+        # Transparent canvas rules out parent inheritance styling glitches
+        self.browser.setStyleSheet(f"""
+            QTextBrowser {{
+                background: transparent;
+                border: none;
+                color: {text_color};
+            }}
+        """)
+
+        # Process text and update content window
+        html_content = render_markdown_to_html(text)
+        self.browser.setHtml(html_content)
+
+        # Dynamic multi-line height computation framework
+        doc = self.browser.document()
+        doc.setTextWidth(450) # Bind text tracking constraint boundary layout 
+        ideal_width = int(doc.idealWidth()) + 25
+        ideal_height = int(doc.size().height()) + 10
+
+        # Enforce elastic sizing guidelines
+        self.browser.setFixedSize(QSize(min(ideal_width, 450), ideal_height))
+        self.bubble.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        
+        bubble_layout.addWidget(self.browser)
+
     class AtlasGUI(QWidget):
         def __init__(self, assistant: AtlasAI):
             super().__init__()
             self.assistant = assistant
-            self.setWindowTitle("Atlas AI")
-            self.setGeometry(120, 80, 900, 600)
-            self.setMinimumSize(720, 500)
+            self.setWindowTitle("Atlas")
+            self.setGeometry(80, 60, 1100, 700)
+            self.setMinimumSize(800, 520)
             
-            # ChatGPT-inspired dark theme with Claude's polish
-            self.setStyleSheet(
-                "QWidget { background: #0f172a; color: #e2e8f0; }"
-                "QPushButton { background: #3b82f6; color: #ffffff; border-radius: 6px; padding: 8px 14px; font-weight: 600; border: none; }"
-                "QPushButton:hover { background: #2563eb; }"
-                "QPushButton:pressed { background: #1d4ed8; }"
-                "QLineEdit { background: #1e293b; color: #f8fafc; border: 1px solid #475569; border-radius: 8px; padding: 10px 14px; }"
-                "QLineEdit:focus { border: 2px solid #3b82f6; }"
-                "QLabel { color: #e2e8f0; }"
-                "QMenuBar { background: #0f172a; color: #cbd5e1; border-bottom: 1px solid #1e293b; }"
-                "QMenuBar::item:selected { background: #1e293b; }"
-                "QMenu { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; }"
-                "QMenu::item:selected { background: #334155; }"
+            # ── Global stylesheet ─────────────────────────────────────────────
+            BG_DEEP   = "#09090b"   # near-black main bg
+            BG_SIDE   = "#111113"   # sidebar bg — slightly lifted
+            BG_CARD   = "#18181b"   # card / bubble bg
+            BG_INPUT  = "#1c1c1f"   # input field bg
+            BORDER    = "#27272a"   # subtle border colour
+            ACCENT    = "#6366f1"   # indigo accent
+            ACCENT_HV = "#818cf8"   # hover accent
+            TEXT_PRI  = "#fafafa"
+            TEXT_SEC  = "#a1a1aa"
+            TEXT_MUT  = "#52525b"
+
+            self.setStyleSheet(f"""
+                QWidget {{ background: {BG_DEEP}; color: {TEXT_PRI}; font-family: 'JetBrains Mono', 'Fira Code', monospace; }}
+                QPushButton {{ background: {BG_CARD}; color: {TEXT_PRI}; border-radius: 6px;
+                               padding: 7px 14px; font-weight: 600; border: 1px solid {BORDER}; font-size: 13px; }}
+                QPushButton:hover {{ background: {BORDER}; border-color: {ACCENT}; color: {ACCENT_HV}; }}
+                QPushButton:pressed {{ background: {ACCENT}; color: #fff; border-color: {ACCENT}; }}
+                QPushButton#accentBtn {{ background: {ACCENT}; color: #fff; border: none; }}
+                QPushButton#accentBtn:hover {{ background: {ACCENT_HV}; }}
+                QPushButton#sidebarBtn {{ background: transparent; color: {TEXT_SEC}; border: none;
+                                          border-radius: 6px; padding: 8px 12px; text-align: left; font-size: 13px; }}
+                QPushButton#sidebarBtn:hover {{ background: {BG_CARD}; color: {TEXT_PRI}; }}
+                QPushButton#sidebarBtn:pressed {{ background: {BORDER}; }}
+                QLineEdit {{ background: {BG_INPUT}; color: {TEXT_PRI}; border: 1px solid {BORDER};
+                             border-radius: 10px; padding: 10px 16px; font-size: 14px; }}
+                QLineEdit:focus {{ border: 1px solid {ACCENT}; }}
+                QScrollArea {{ border: none; background: transparent; }}
+                QScrollBar:vertical {{ background: transparent; width: 6px; margin: 0; }}
+                QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 3px; min-height: 24px; }}
+                QScrollBar::handle:vertical:hover {{ background: {TEXT_MUT}; }}
+                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+                QListWidget {{ background: transparent; border: none; color: {TEXT_SEC}; font-size: 13px; }}
+                QListWidget::item {{ padding: 8px 10px; border-radius: 6px; margin: 1px 0; }}
+                QListWidget::item:hover {{ background: {BG_CARD}; color: {TEXT_PRI}; }}
+                QListWidget::item:selected {{ background: {BG_CARD}; color: {TEXT_PRI}; border: none; }}
+                QMenu {{ background: {BG_CARD}; color: {TEXT_PRI}; border: 1px solid {BORDER}; border-radius: 8px; padding: 4px; }}
+                QMenu::item {{ padding: 6px 20px; border-radius: 4px; }}
+                QMenu::item:selected {{ background: {BORDER}; }}
+                QDialog {{ background: {BG_DEEP}; }}
+                QTextEdit {{ background: {BG_CARD}; color: {TEXT_SEC}; border: 1px solid {BORDER}; border-radius: 6px; }}
+                QComboBox {{ background: {BG_CARD}; color: {TEXT_PRI}; border: 1px solid {BORDER}; border-radius: 6px; padding: 4px 10px; }}
+            """)
+
+            # ── Root layout: sidebar | chat ───────────────────────────────────
+            root = QHBoxLayout(self)
+            root.setContentsMargins(0, 0, 0, 0)
+            root.setSpacing(0)
+
+            # ═══════════════════════════════════════════════════════
+            #  LEFT SIDEBAR
+            # ═══════════════════════════════════════════════════════
+            sidebar = QWidget()
+            sidebar.setFixedWidth(240)
+            sidebar.setStyleSheet(f"QWidget {{ background: {BG_SIDE}; border-right: 1px solid {BORDER}; }}")
+            sidebar_layout = QVBoxLayout(sidebar)
+            sidebar_layout.setContentsMargins(10, 14, 10, 14)
+            sidebar_layout.setSpacing(4)
+
+            # Brand
+            brand = QLabel("Atlas")
+            brand.setStyleSheet(f"font-size: 20px; font-weight: 800; color: {TEXT_PRI}; letter-spacing: -0.5px; padding: 4px 6px 10px 6px;")
+            sidebar_layout.addWidget(brand)
+
+            # New chat button
+            new_chat_btn = QPushButton("  + New chat")
+            new_chat_btn.setObjectName("sidebarBtn")
+            new_chat_btn.setStyleSheet(
+                f"QPushButton {{ background: {BG_CARD}; color: {TEXT_PRI}; border: 1px solid {BORDER}; "
+                f"border-radius: 8px; padding: 9px 14px; font-size: 13px; font-weight: 600; text-align: left; }}"
+                f"QPushButton:hover {{ border-color: {ACCENT}; color: {ACCENT_HV}; }}"
             )
+            new_chat_btn.clicked.connect(self._on_new_chat)
+            sidebar_layout.addWidget(new_chat_btn)
+            sidebar_layout.addSpacing(10)
 
-            outer_layout = QVBoxLayout(self)
-            outer_layout.setContentsMargins(0, 0, 0, 0)
-            outer_layout.setSpacing(0)
-            
-            # Header with title and model info
-            header_widget = QWidget()
-            header_widget.setStyleSheet("QWidget { background: #0f172a; border-bottom: 1px solid #1e293b; }")
-            header_layout = QVBoxLayout(header_widget)
-            header_layout.setContentsMargins(16, 12, 16, 12)
-            header_layout.setSpacing(4)
-            
-            title_label = QLabel("Atlas")
-            title_label.setStyleSheet("font-size: 24px; font-weight: 700; color: #f8fafc;")
-            
-            subtitle_layout = QHBoxLayout()
-            model_name = os.path.basename(self.assistant.model_path) if self.assistant.model_path else "No model loaded"
-            subtitle_label = QLabel(model_name[:40])
-            subtitle_label.setStyleSheet("color: #94a3b8; font-size: 12px;")
-            subtitle_layout.addWidget(subtitle_label)
-            subtitle_layout.addStretch()
-            
-            header_layout.addWidget(title_label)
-            header_layout.addLayout(subtitle_layout)
-            outer_layout.addWidget(header_widget)
+            # Chats section label
+            chats_label = QLabel("Recents")
+            chats_label.setStyleSheet(f"color: {TEXT_MUT}; font-size: 11px; font-weight: 700; letter-spacing: 0.8px; padding: 0 6px;")
+            sidebar_layout.addWidget(chats_label)
 
-            # Menu bar
-            menubar = QMenuBar()
-            menubar.setMinimumHeight(24)
-            menubar.setStyleSheet("QMenuBar { background: #0f172a; color: #cbd5e1; border: none; padding: 0px 16px; }")
-            file_menu = menubar.addMenu("File")
-            self.chat_menu = menubar.addMenu("Chats")
-            self.action_save_chat = QAction("Save Chat As...", self)
-            self.action_save_chat.triggered.connect(self._on_save_chat_as)
-            self.chat_menu.addAction(self.action_save_chat)
-            self.action_load_chat = QAction("Load Chat...", self)
-            self.action_load_chat.triggered.connect(self._on_load_chat)
-            self.chat_menu.addAction(self.action_load_chat)
-            self.chat_menu.addSeparator()
-            self.action_new_chat = QAction("New Chat", self)
-            self.action_new_chat.triggered.connect(self._on_new_chat)
-            self.chat_menu.addAction(self.action_new_chat)
-            self.chat_menu.addSeparator()
-            self.action_save_chat_history = QAction("Save Current Chat", self)
-            self.action_save_chat_history.triggered.connect(self._on_save_chat)
-            self.chat_menu.addAction(self.action_save_chat_history)
-            self.model_menu = menubar.addMenu("Model")
-            self._populate_model_menu()
-            debug_menu = menubar.addMenu("Debug")
-            self.action_show_debug = QAction("Show Debug Panel", self)
-            self.action_show_debug.setCheckable(True)
-            self.action_show_debug.toggled.connect(self._toggle_debug_panel)
-            debug_menu.addAction(self.action_show_debug)
+            # Chat history list
+            self.chat_history_list = QListWidget()
+            self.chat_history_list.setStyleSheet(
+                f"QListWidget {{ background: transparent; border: none; }}"
+                f"QListWidget::item {{ padding: 7px 8px; border-radius: 6px; color: {TEXT_SEC}; font-size: 13px; }}"
+                f"QListWidget::item:hover {{ background: {BG_CARD}; color: {TEXT_PRI}; }}"
+                f"QListWidget::item:selected {{ background: {BG_CARD}; color: {TEXT_PRI}; }}"
+            )
+            self.chat_history_list.itemClicked.connect(self._on_chat_history_item_clicked)
+            sidebar_layout.addWidget(self.chat_history_list, 1)  # stretch
 
-            # Memory Insight Window
-            memory_menu = menubar.addMenu("Memory")
-            self.action_show_memory_panel = QAction("Show Engram Panel", self)
-            self.action_show_memory_panel.setCheckable(True)
-            self.action_show_memory_panel.toggled.connect(self._toggle_memory_panel)
-            memory_menu.addAction(self.action_show_memory_panel)
+            self._refresh_chat_list()
+
+            # ── Sidebar footer ────────────────────────────────────
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            sep.setStyleSheet(f"color: {BORDER}; background: {BORDER}; max-height: 1px;")
+            sidebar_layout.addWidget(sep)
+            sidebar_layout.addSpacing(6)
+
+            # Memory engram toggle button
+            self.memory_btn = QPushButton("🧠  Memory Engrams")
+            self.memory_btn.setObjectName("sidebarBtn")
+            self.memory_btn.setCheckable(True)
+            self.memory_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {TEXT_SEC}; border: none; "
+                f"border-radius: 6px; padding: 8px 10px; font-size: 13px; text-align: left; }}"
+                f"QPushButton:hover {{ background: {BG_CARD}; color: {TEXT_PRI}; }}"
+                f"QPushButton:checked {{ background: {BG_CARD}; color: {ACCENT_HV}; }}"
+            )
+            self.memory_btn.toggled.connect(self._toggle_memory_panel)
             self._memory_insight_window: Optional["MemoryInsightWindow"] = None
+            sidebar_layout.addWidget(self.memory_btn)
+            sidebar_layout.addSpacing(4)
 
-            outer_layout.addWidget(menubar)
+            # Model section
+            model_sep = QFrame()
+            model_sep.setFrameShape(QFrame.HLine)
+            model_sep.setStyleSheet(f"color: {BORDER}; background: {BORDER}; max-height: 1px;")
+            sidebar_layout.addWidget(model_sep)
+            sidebar_layout.addSpacing(6)
 
+            # Workspace button — above model info
+            ws_root = self.assistant.workspace.root
+            ws_label_text = f"📁  {os.path.basename(ws_root) or ws_root}" if ws_root else "📁  Set Workspace"
+            self.workspace_btn = QPushButton(ws_label_text)
+            self.workspace_btn.setObjectName("sidebarBtn")
+            self.workspace_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {TEXT_SEC}; border: none; "
+                f"border-radius: 6px; padding: 8px 10px; font-size: 13px; text-align: left; }}"
+                f"QPushButton:hover {{ background: {BG_CARD}; color: {TEXT_PRI}; }}"
+                f"QPushButton:checked {{ background: {BG_CARD}; color: {ACCENT_HV}; }}"
+            )
+            self.workspace_btn.clicked.connect(self._on_set_workspace)
+            sidebar_layout.addWidget(self.workspace_btn)
+            sidebar_layout.addSpacing(4)
+
+            ws_sep = QFrame()
+            ws_sep.setFrameShape(QFrame.HLine)
+            ws_sep.setStyleSheet(f"color: {BORDER}; background: {BORDER}; max-height: 1px;")
+            sidebar_layout.addWidget(ws_sep)
+            sidebar_layout.addSpacing(6)
+
+            model_name = os.path.basename(self.assistant.model_path) if self.assistant.model_path else "No model loaded"
+            self.model_label = QLabel(f"⚙  {model_name[:28]}")
+            self.model_label.setStyleSheet(f"color: {TEXT_MUT}; font-size: 11px; padding: 0 6px 2px 6px;")
+            self.model_label.setWordWrap(True)
+            sidebar_layout.addWidget(self.model_label)
+
+            model_btn_row = QHBoxLayout()
+            model_btn_row.setSpacing(6)
+            load_model_btn = QPushButton("Load model")
+            load_model_btn.setObjectName("sidebarBtn")
+            load_model_btn.clicked.connect(self._on_load_model)
+            unload_model_btn = QPushButton("Unload")
+            unload_model_btn.setObjectName("sidebarBtn")
+            unload_model_btn.clicked.connect(self._on_unload_model)
+            model_btn_row.addWidget(load_model_btn)
+            model_btn_row.addWidget(unload_model_btn)
+            sidebar_layout.addLayout(model_btn_row)
+
+            root.addWidget(sidebar)
+
+            # ═══════════════════════════════════════════════════════
+            #  MAIN AREA  (chat + input)
+            # ═══════════════════════════════════════════════════════
+            main_area = QWidget()
+            main_area.setStyleSheet(f"QWidget {{ background: {BG_DEEP}; }}")
+            main_layout = QVBoxLayout(main_area)
+            main_layout.setContentsMargins(0, 0, 0, 0)
+            main_layout.setSpacing(0)
+
+            # Thin top bar with debug toggle
+            topbar = QWidget()
+            topbar.setFixedHeight(40)
+            topbar.setStyleSheet(f"QWidget {{ background: {BG_DEEP}; border-bottom: 1px solid {BORDER}; }}")
+            topbar_layout = QHBoxLayout(topbar)
+            topbar_layout.setContentsMargins(20, 0, 16, 0)
+            topbar_row_label = QLabel("Atlas AI")
+            topbar_row_label.setStyleSheet(f"color: {TEXT_MUT}; font-size: 12px; font-weight: 600; letter-spacing: 0.5px;")
+            debug_btn = QPushButton("Debug")
+            debug_btn.setFixedSize(60, 26)
+            debug_btn.setCheckable(True)
+            debug_btn.setStyleSheet(
+                f"QPushButton {{ background: transparent; color: {TEXT_MUT}; border: 1px solid {BORDER}; "
+                f"border-radius: 5px; font-size: 11px; padding: 0; }}"
+                f"QPushButton:hover {{ color: {TEXT_PRI}; border-color: {TEXT_MUT}; }}"
+                f"QPushButton:checked {{ color: {ACCENT_HV}; border-color: {ACCENT}; }}"
+            )
+            debug_btn.toggled.connect(self._toggle_debug_panel)
+            topbar_layout.addWidget(topbar_row_label)
+            topbar_layout.addStretch()
+            topbar_layout.addWidget(debug_btn)
+            main_layout.addWidget(topbar)
+
+            # Debug dialog
             self.debug_dialog = QDialog(self)
             self.debug_dialog.setWindowTitle("Atlas Debug")
             self.debug_dialog.resize(700, 500)
@@ -1953,94 +2353,134 @@ if _HAS_QT:
             self.debug_text.setReadOnly(True)
             debug_layout.addWidget(self.debug_text)
             self.debug_dialog.setLayout(debug_layout)
+            self._current_stream_bubble = None
 
-            # Chat area with clean scrolling
+            # Chat area with scroll
             self.scroll_area = QScrollArea()
             self.scroll_area.setWidgetResizable(True)
-            self.scroll_area.setStyleSheet("QScrollArea { border: none; background: #0f172a; }")
-            self.scroll_area.verticalScrollBar().setStyleSheet(
-                "QScrollBar:vertical { background: #0f172a; width: 8px; }"
-                "QScrollBar::handle:vertical { background: #475569; border-radius: 4px; }"
-                "QScrollBar::handle:vertical:hover { background: #64748b; }"
-            )
-            
+            self.scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }") # Clean borderless look
+        
             self.chat_container = QWidget()
-            self.chat_container.setStyleSheet("QWidget { background: #0f172a; }")
+            self.chat_container.setStyleSheet("background: transparent;")
             self.chat_layout = QVBoxLayout(self.chat_container)
-            self.chat_layout.setContentsMargins(16, 16, 16, 16)
-            self.chat_layout.setSpacing(16)
-            self.chat_layout.addStretch()
+            self.chat_layout.setContentsMargins(5, 5, 5, 5)
+            self.chat_layout.setSpacing(10) # Keeps spacing tight between message clusters
+            self.chat_layout.addStretch(1)
             self.scroll_area.setWidget(self.chat_container)
+            main_layout.addWidget(self.scroll_area, 1)
 
-            # Input area with better styling
-            input_widget = QWidget()
-            input_widget.setStyleSheet("QWidget { background: #0f172a; border-top: 1px solid #1e293b; }")
-            input_layout = QVBoxLayout(input_widget)
-            input_layout.setContentsMargins(16, 12, 16, 16)
-            input_layout.setSpacing(8)
-            
-            input_field_layout = QHBoxLayout()
-            input_field_layout.setContentsMargins(0, 0, 0, 0)
-            input_field_layout.setSpacing(8)
+            # Input area
+            input_wrapper = QWidget()
+            input_wrapper.setStyleSheet(f"QWidget {{ background: {BG_DEEP}; }}")
+            input_outer = QVBoxLayout(input_wrapper)
+            input_outer.setContentsMargins(60, 10, 60, 20)
+            input_outer.setSpacing(6)
 
-            # DragDropLineEdit — accepts [Context Note: …] text dropped from MemoryInsightWindow
+            input_box = QWidget()
+            input_box.setStyleSheet(
+                f"QWidget {{ background: {BG_INPUT}; border: 1px solid {BORDER}; "
+                f"border-radius: 12px; }}"
+            )
+            input_box_layout = QHBoxLayout(input_box)
+            input_box_layout.setContentsMargins(14, 6, 8, 6)
+            input_box_layout.setSpacing(8)
+
+            # DragDropLineEdit — accepts [Context Note: …] drops from MemoryInsightWindow
+            ACCENT_LOCAL = ACCENT
+            ACCENT_HV_LOCAL = ACCENT_HV
+            BORDER_LOCAL = BORDER
+            BG_INPUT_LOCAL = BG_INPUT
+            TEXT_PRI_LOCAL = TEXT_PRI
+
             class DragDropLineEdit(QLineEdit):
                 def customDragEnterEvent(self, event) -> None:  # type: ignore[override]
-                    if event.mimeData().hasText():
-                        text = event.mimeData().text()
-                        if text.startswith("[Context Note:"):
-                            event.acceptProposedAction()
-                            self.setStyleSheet(
-                                "QLineEdit { background: #1e3a5f; color: #f8fafc; "
-                                "border: 2px solid #60a5fa; border-radius: 8px; padding: 10px 14px; }"
-                            )
-                            return
-                    event.ignore()
+                    if event.mimeData().hasText() and event.mimeData().text().startswith("[Context Note:"):
+                        event.acceptProposedAction()
+                        self.setStyleSheet(
+                            f"QLineEdit {{ background: transparent; color: {TEXT_PRI_LOCAL}; "
+                            f"border: none; padding: 6px 0; font-size: 14px; }}"
+                        )
+                    else:
+                        event.ignore()
 
                 def dragEnterEvent(self, event) -> None:  # type: ignore[override]
                     self.customDragEnterEvent(event)
 
                 def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
                     self.setStyleSheet(
-                        "QLineEdit { background: #1e293b; color: #f8fafc; "
-                        "border: 1px solid #475569; border-radius: 8px; padding: 10px 14px; }"
-                        "QLineEdit:focus { border: 2px solid #3b82f6; }"
+                        f"QLineEdit {{ background: transparent; color: {TEXT_PRI_LOCAL}; "
+                        f"border: none; padding: 6px 0; font-size: 14px; }}"
                     )
 
                 def customDropEvent(self, event) -> None:  # type: ignore[override]
                     if event.mimeData().hasText():
                         inject = event.mimeData().text()
                         current = self.text()
-                        # Prepend the inject; keep any existing text the user has typed
-                        separator = " " if current and not current.startswith(" ") else ""
-                        self.setText(inject + separator + current)
+                        sep = " " if current and not current.startswith(" ") else ""
+                        self.setText(inject + sep + current)
                         self.setCursorPosition(len(self.text()))
                         event.acceptProposedAction()
-                    self.dragLeaveEvent(event)  # reset highlight
+                    self.dragLeaveEvent(event)
 
                 def dropEvent(self, event) -> None:  # type: ignore[override]
                     self.customDropEvent(event)
 
             self.input_line = DragDropLineEdit()
             self.input_line.setAcceptDrops(True)
-            self.input_line.setPlaceholderText("Ask Atlas anything...")
-            self.input_line.setMinimumHeight(40)
+            self.input_line.setPlaceholderText("Message Atlas…")
+            self.input_line.setStyleSheet(
+                f"QLineEdit {{ background: transparent; color: {TEXT_PRI}; border: none; "
+                f"padding: 6px 0; font-size: 14px; }}"
+            )
             self.input_line.returnPressed.connect(self.on_send)
-            self.send_button = QPushButton("Send")
-            self.send_button.setMinimumHeight(40)
-            self.send_button.setMaximumWidth(80)
-            self.send_button.clicked.connect(self.on_send)
-            input_field_layout.addWidget(self.input_line)
-            input_field_layout.addWidget(self.send_button)
-            
-            self.status_label = QLabel("")
-            self.status_label.setStyleSheet("color: #64748b; font-size: 12px; margin-left: 4px;")
-            
-            input_layout.addLayout(input_field_layout)
-            input_layout.addWidget(self.status_label)
 
-            outer_layout.addWidget(self.scroll_area)
-            outer_layout.addWidget(input_widget)
+            self.send_button = QPushButton("↑")
+            self.send_button.setObjectName("accentBtn")
+            self.send_button.setFixedSize(36, 36)
+            self.send_button.setStyleSheet(
+                f"QPushButton {{ background: {ACCENT}; color: #fff; border-radius: 8px; "
+                f"font-size: 18px; font-weight: 700; border: none; padding: 0; }}"
+                f"QPushButton:hover {{ background: {ACCENT_HV}; }}"
+                f"QPushButton:disabled {{ background: {BORDER}; color: {TEXT_MUT}; }}"
+            )
+            self.send_button.clicked.connect(self.on_send)
+
+            input_box_layout.addWidget(self.input_line, 1)
+            input_box_layout.addWidget(self.send_button)
+            input_outer.addWidget(input_box)
+
+            self.status_label = QLabel("")
+            self.status_label.setStyleSheet(f"color: {TEXT_MUT}; font-size: 11px; padding: 0 4px;")
+            input_outer.addWidget(self.status_label)
+
+            main_layout.addWidget(input_wrapper)
+            root.addWidget(main_area, 1)
+
+        def _refresh_chat_list(self) -> None:
+            """Populate the sidebar chat history list from disk."""
+            self.chat_history_list.clear()
+            if not os.path.isdir(CHAT_LOG_DIR):
+                return
+            files = sorted(
+                [f for f in os.listdir(CHAT_LOG_DIR) if f.endswith(".jsonl")],
+                reverse=True,
+            )
+            for fname in files[:40]:
+                display = os.path.splitext(fname)[0].replace("_", " ")
+                item = QListWidgetItem(display)
+                item.setData(Qt.UserRole, os.path.join(CHAT_LOG_DIR, fname))
+                self.chat_history_list.addItem(item)
+
+        def _on_chat_history_item_clicked(self, item: "QListWidgetItem") -> None:
+            path = item.data(Qt.UserRole)
+            if path and os.path.exists(path):
+                response = self.assistant.load_chat_history_file(path)
+                self._clear_chat_view()
+                # Re-render loaded history
+                for entry in self.assistant.history:
+                    role = "You" if entry.get("role") == "user" else "Atlas"
+                    self._append_chat(role, entry.get("message", ""))
+                self._append_chat("Atlas", response)
 
         def _append_chat(self, role: str, text: str, details: str = "") -> None:
             bubble = ChatBubble(self.assistant, role, text, details)
@@ -2053,7 +2493,7 @@ if _HAS_QT:
             )
 
         def _append_debug(self, text: str) -> None:
-            if hasattr(self, 'debug_text') and self.debug_text is not None:
+            if hasattr(self, "debug_text") and self.debug_text is not None:
                 self.debug_text.append(text)
 
         def _toggle_debug_panel(self, checked: bool) -> None:
@@ -2076,6 +2516,58 @@ if _HAS_QT:
                 if self._memory_insight_window is not None:
                     self._memory_insight_window.hide()
 
+        def add_message(self, sender: str, text: str) -> None:
+        if self.thinking_label:
+            self.chat_layout.removeWidget(self.thinking_label)
+            self.thinking_label.deleteLater()
+            self.thinking_label = None
+
+        is_user = (sender.lower() == "user" or sender.lower() == "you")
+        
+        # Initialize a permanent, non-streaming layout component
+        bubble = StyledBubble(text, is_user=is_user)
+        
+        # Safely insert right above your trailing alignment stretch spacer
+        count = self.chat_layout.count()
+        self.chat_layout.insertWidget(count - 1, bubble)
+        self.scroll_to_bottom()
+
+    def update_chat(self, sender: str, text: str) -> None:
+        if self.thinking_label:
+            self.chat_layout.removeWidget(self.thinking_label)
+            self.thinking_label.deleteLater()
+            self.thinking_label = None
+
+        is_user = (sender.lower() == "user" or sender.lower() == "you")
+
+        # Track down if our active stream bubble already exists in the layout view.
+        # If it doesn't, create a new one instantly on the fly.
+        if not hasattr(self, "_current_stream_bubble") or self._current_stream_bubble is None:
+            self._current_stream_bubble = StyledBubble(text, is_user=is_user)
+            count = self.chat_layout.count()
+            self.chat_layout.insertWidget(count - 1, self._current_stream_bubble)
+        else:
+            # If it already exists, feed the updated complete text string into the HTML browser layout
+            self._current_stream_bubble.update_text(text)
+
+        self.scroll_to_bottom()
+
+
+        def _on_set_workspace(self) -> None:
+            path = QFileDialog.getExistingDirectory(
+                self,
+                "Choose Workspace Directory",
+                self.assistant.workspace.root or str(pathlib.Path.home()),
+            )
+            if not path:
+                return
+            result = self.assistant.workspace.set_root(path)
+            self._append_chat("Atlas", result)
+            self.assistant.history.append({"role": "assistant", "message": result})
+            # Update sidebar button label
+            label = f"📁  {os.path.basename(path) or path}"
+            self.workspace_btn.setText(label)
+
         def _on_load_model(self) -> None:
             path, _ = QFileDialog.getOpenFileName(
                 self,
@@ -2089,12 +2581,66 @@ if _HAS_QT:
             self._append_chat("Atlas", response)
             self.assistant.history.append({"role": "assistant", "message": response})
             self.assistant.save_chat_history()
+            self.model_label.setText(f"⚙  {os.path.basename(path)[:28]}")
 
         def _on_unload_model(self) -> None:
             self.assistant.llm = None
             self.assistant.model_path = None
             import gc; gc.collect()
             self.assistant.gpu_layers = 0
+            self.model_label.setText("⚙  No model loaded")
+            response = "No model loaded. Atlas is now in no-model mode."
+            self._append_chat("Atlas", response)
+            self.assistant.history.append({"role": "assistant", "message": response})
+            self.assistant.save_chat_history()
+
+            if not hasattr(self, "_current_stream_bubble") or self._current_stream_bubble is None:
+                self._current_stream_bubble = StyledBubble(text, is_user=is_user)
+                count = self.chat_layout.count()
+                self.chat_layout.insertWidget(count - 1, self._current_stream_bubble)
+            else:
+                # If it already exists, just pipe the updated live text chunk over
+                self._current_stream_bubble.update_text(text)
+
+            self.scroll_to_bottom()
+
+
+        def _on_set_workspace(self) -> None:
+            path = QFileDialog.getExistingDirectory(
+                self,
+                "Choose Workspace Directory",
+                self.assistant.workspace.root or str(pathlib.Path.home()),
+            )
+            if not path:
+                return
+            result = self.assistant.workspace.set_root(path)
+            self._append_chat("Atlas", result)
+            self.assistant.history.append({"role": "assistant", "message": result})
+            # Update sidebar button label
+            label = f"📁  {os.path.basename(path) or path}"
+            self.workspace_btn.setText(label)
+
+        def _on_load_model(self) -> None:
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select GGUF Model",
+                MODEL_SEARCH_DIR,
+                "GGUF Files (*.gguf);;All Files (*)",
+            )
+            if not path:
+                return
+            response = self.assistant.load_model(path)
+            self._append_chat("Atlas", response)
+            self.assistant.history.append({"role": "assistant", "message": response})
+            self.assistant.save_chat_history()
+            self.model_label.setText(f"⚙  {os.path.basename(path)[:28]}")
+
+        def _on_unload_model(self) -> None:
+            self.assistant.llm = None
+            self.assistant.model_path = None
+            import gc; gc.collect()
+            self.assistant.gpu_layers = 0
+            self.model_label.setText("⚙  No model loaded")
             response = "No model loaded. Atlas is now in no-model mode."
             self._append_chat("Atlas", response)
             self.assistant.history.append({"role": "assistant", "message": response})
@@ -2105,33 +2651,7 @@ if _HAS_QT:
             self._append_chat("Atlas", response)
             self.assistant.history.append({"role": "assistant", "message": response})
             self.assistant.save_chat_history()
-
-        def _populate_model_menu(self) -> None:
-            self.model_menu.clear()
-            unload_action = QAction("Unload model / no model", self)
-            unload_action.triggered.connect(self._on_unload_model)
-            self.model_menu.addAction(unload_action)
-            self.model_menu.addSeparator()
-            try:
-                models = find_gguf_models()
-            except Exception:
-                models = []
-
-            if not models:
-                action = QAction("No models found", self)
-                action.setEnabled(False)
-                self.model_menu.addAction(action)
-            else:
-                for model_path in models:
-                    model_name = os.path.basename(model_path)
-                    action = QAction(model_name, self)
-                    action.setData(model_path)
-                    action.triggered.connect(lambda checked, p=model_path: self._on_select_model(p))
-                    self.model_menu.addAction(action)
-                self.model_menu.addSeparator()
-                refresh_action = QAction("Refresh models", self)
-                refresh_action.triggered.connect(self._populate_model_menu)
-                self.model_menu.addAction(refresh_action)
+            self.model_label.setText(f"⚙  {os.path.basename(model_path)[:28]}")
 
         def _on_save_chat_as(self) -> None:
             name, ok = QInputDialog.getText(self, "Save Chat As", "Enter chat name (1-3 words):")
@@ -2140,11 +2660,13 @@ if _HAS_QT:
             response = self.assistant.save_chat_history(name.strip())
             self._append_chat("Atlas", response)
             self.assistant.history.append({"role": "assistant", "message": response})
+            self._refresh_chat_list()
 
         def _on_save_chat(self) -> None:
             response = self.assistant.save_chat_history()
             self._append_chat("Atlas", response)
             self.assistant.history.append({"role": "assistant", "message": response})
+            self._refresh_chat_list()
 
         def _clear_chat_view(self) -> None:
             while self.chat_layout.count():
@@ -2160,12 +2682,12 @@ if _HAS_QT:
                     self.assistant.save_chat_history()
                 except Exception:
                     pass
-
             self.assistant.history = []
             self.assistant.chat_filename = None
             self._clear_chat_view()
             self._append_chat("Atlas", "Started a new chat.")
             self.status_label.setText("New chat ready")
+            self._refresh_chat_list()
 
         def _on_load_chat(self) -> None:
             os.makedirs(CHAT_LOG_DIR, exist_ok=True)
@@ -2190,7 +2712,7 @@ if _HAS_QT:
             self.current_user_text = user_text
             self.assistant.history.append({"role": "user", "message": user_text})
             self.input_line.clear()
-            self.status_label.setText("Thinking...")
+            self.status_label.setText("Thinking…")
             self.send_button.setEnabled(False)
             QApplication.processEvents()
 
@@ -2201,6 +2723,7 @@ if _HAS_QT:
                 self.assistant.save_chat_history()
                 self.send_button.setEnabled(True)
                 self.status_label.setText("")
+                self._refresh_chat_list()
                 return
 
             self._append_debug(f"[DEBUG] User input: {user_text}\n")
@@ -2219,11 +2742,13 @@ if _HAS_QT:
                 self._append_debug(f"[DEBUG] Raw model response:\n{self.assistant.last_raw_response}\n")
             self.send_button.setEnabled(True)
             self.status_label.setText("")
+            self._refresh_chat_list()
 
         def _on_response_error(self, error_message: str) -> None:
             self._append_chat("Atlas", f"Error: {error_message}")
             self.send_button.setEnabled(True)
             self.status_label.setText("")
+
 
 
 def select_model(models: List[str], fallback: Optional[str] = None) -> str:
