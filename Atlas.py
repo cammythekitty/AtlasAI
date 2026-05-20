@@ -31,7 +31,7 @@ except Exception:
 
 try:
     from PySide6.QtCore import Qt, QTimer, Signal, QThread, QMimeData
-    from PySide6.QtGui import QAction, QDrag, QPixmap
+    from PySide6.QtGui import QAction, QDrag
     from PySide6.QtWidgets import (
         QApplication,
         QWidget,
@@ -48,15 +48,14 @@ try:
         QDialogButtonBox,
         QFileDialog,
         QInputDialog,
-        QSplitter,
         QListWidget,
         QListWidgetItem,
-        QAbstractItemView,
+        QFrame,
+        QSizePolicy,
     )
     _HAS_QT = True
 except Exception:
-    # (Keep your existing fallback line below it)
-    Qt = QTimer = Signal = QThread = QApplication = QWidget = QVBoxLayout = QHBoxLayout = QLabel = QLineEdit = QPushButton = QScrollArea = QMenuBar = QAction = QTextEdit = QDialog = QFileDialog = QInputDialog = None
+    Qt = QTimer = Signal = QThread = QMimeData = QApplication = QWidget = QVBoxLayout = QHBoxLayout = QLabel = QLineEdit = QPushButton = QScrollArea = QMenuBar = QAction = QTextEdit = QDialog = QFileDialog = QInputDialog = QListWidget = QListWidgetItem = QFrame = QSizePolicy = QDrag = None
     _HAS_QT = False
 
 class UserWarning:
@@ -294,6 +293,7 @@ ENABLE_AUTO_MEMORY = os.environ.get("ATLASAI_AUTO_MEMORY", "1") == "1"
 ENGRAM_TYPE_WEIGHTS = {
     "preference": 1.5,
     "manual": 1.4,
+    "insight": 1.6,
     "web": 1.2,
     "fact": 1.0,
     "event": 1.1,
@@ -468,27 +468,13 @@ class MemoryStore:
     def search(self, query: str, top_k: int = 4) -> List[str]:
         if not self.entries:
             return []
-
-        # Filter out anything you dragged into the Vault list in your GUI
-        valid_entries = [e for e in self.entries if not e.get("vaulted", False)]
-        if not valid_entries:
-            return []
-
         query_emb = self._embed_text([query])[0]
         if self.embeddings is None:
             return []
-            
         scores = np.dot(self.embeddings, query_emb)
         now = time.time()
         scored: List[Tuple[float, Dict[str, Any]]] = []
-        
         for i, sim in enumerate(scores.tolist()):
-            entry = self.entries[i]
-            
-            # Skip scoring this entry if it's currently vaulted
-            if entry.get("vaulted", False):
-                continue
-
             entry = self.entries[i]
             age = now - entry.get("timestamp", now)
             decay = math.exp(-age / HALF_LIFE_SECONDS)
@@ -717,84 +703,6 @@ def duckduckgo_search(query: str, max_results: int = 4) -> Dict[str, Any]:
 
     return {"query": query, "summary": summary.strip(), "sources": sources}
 
-class MemoryManagerWindow(QDialog):
-    """
-    Pop-out panel with Discord-style dual list columns.
-    Allows dragging nodes back and forth to mute or unmute context.
-    """
-    def __init__(self, assistant_backend, parent=None):
-        super().__init__(parent)
-        self.assistant = assistant_backend
-        self.setWindowTitle("🧠 AtlasAI Memory Hub Console")
-        self.resize(750, 500)
-        
-        main_layout = QVBoxLayout(self)
-        splitter = QSplitter(Qt.Horizontal, self)
-        
-        # Left List Container
-        left_container = QWidget()
-        left_layout = QVBoxLayout(left_container)
-        left_layout.addWidget(QLabel("🔥 Active Context Engrams (Sent to Prompt Matcher)"))
-        self.active_list = QListWidget()
-        self.active_list.setDragDropMode(QAbstractItemView.DragDrop)
-        self.active_list.setDefaultDropAction(Qt.MoveAction)
-        self.active_list.setAcceptDrops(True)
-        left_layout.addWidget(self.active_list)
-        
-        # Right List Container
-        right_container = QWidget()
-        right_layout = QVBoxLayout(right_container)
-        right_layout.addWidget(QLabel("📁 Vaulted Engrams (Silenced Memory Blocks)"))
-        self.vault_list = QListWidget()
-        self.vault_list.setDragDropMode(QAbstractItemView.DragDrop)
-        self.vault_list.setDefaultDropAction(Qt.MoveAction)
-        self.vault_list.setAcceptDrops(True)
-        right_layout.addWidget(self.vault_list)
-        
-        splitter.addWidget(left_container)
-        splitter.addWidget(right_container)
-        main_layout.addWidget(splitter)
-        
-        self.populate_engram_views()
-        
-        # Listen for drag/drop rows adjustments
-        self.active_list.model().rowsInserted.connect(self.sync_memory_state)
-        self.vault_list.model().rowsInserted.connect(self.sync_memory_state)
-
-    def populate_engram_views(self):
-        self.active_list.clear()
-        self.vault_list.clear()
-        
-        for idx, entry in enumerate(self.assistant.memory.entries):
-            tag = entry.get("tag", "fact").upper()
-            txt_snippet = entry.get("text", "")
-            display_text = f"[{tag}] {txt_snippet}"
-            
-            item = QListWidgetItem(display_text)
-            item.setData(Qt.UserRole, {"id": idx, "raw_entry": entry})
-            
-            if entry.get("vaulted", False):
-                self.vault_list.addItem(item)
-            else:
-                self.active_list.addItem(item)
-
-    def sync_memory_state(self):
-        # Update records in vault pane
-        for r in range(self.vault_list.count()):
-            item = self.vault_list.item(r)
-            data = item.data(Qt.UserRole)
-            if data:
-                data["raw_entry"]["vaulted"] = True
-                
-        # Update records in active pane
-        for r in range(self.active_list.count()):
-            item = self.active_list.item(r)
-            data = item.data(Qt.UserRole)
-            if data:
-                data["raw_entry"]["vaulted"] = False
-                
-        # Save structural change down to memory.jsonl
-        self.assistant.memory.save()
 
 class AtlasAI:
     def __init__(self, model_path: Optional[str] = None, memory_path: str = MEMORY_FILE):
@@ -807,6 +715,9 @@ class AtlasAI:
         self.gpu_layers = int(os.environ.get("ATLASAI_GPU_LAYERS", DEFAULT_GPU_LAYERS))
         self.auto_save_memory = ENABLE_AUTO_MEMORY
         self.llm: Optional[Llama] = None
+        # --- prompt_counter: triggers synthesize_new_memory_node every 5 active cycles ---
+        self._prompt_counter: int = 0
+        self._MEMORY_SYNTHESIS_INTERVAL: int = 5
         if model_path:
             self.llm = self._load_model(model_path)
         self._print_startup_info()
@@ -1139,9 +1050,6 @@ class AtlasAI:
 
         lines: List[str] = []
         for entry in self.memory.entries[-MAX_PROMPT_MEMORY_ENTRIES:]:
-            # If the entry has been dragged to the vault in the GUI, hide it from the prompt snapshot!
-            if entry.get("vaulted", False):
-                continue
             tag = str(entry.get("tag", "fact"))
             weight = float(entry.get("weight", 1.0))
             text = str(entry.get("text", "")).strip().replace("\n", " ")
@@ -1268,6 +1176,13 @@ class AtlasAI:
                     self._auto_save_memory(user, answer)
                 except Exception:
                     pass
+            # --- prompt_counter: synthesise a memory node every N cycles ---
+            self._prompt_counter += 1
+            if self._prompt_counter % self._MEMORY_SYNTHESIS_INTERVAL == 0:
+                try:
+                    self.synthesize_new_memory_node()
+                except Exception:
+                    pass
             return answer
         except RuntimeError as e:
             if "out of memory" in str(e).lower():
@@ -1294,6 +1209,13 @@ class AtlasAI:
             if self.auto_save_memory:
                 try:
                     self._auto_save_memory(user, answer)
+                except Exception:
+                    pass
+            # --- prompt_counter: synthesise a memory node every N cycles ---
+            self._prompt_counter += 1
+            if self._prompt_counter % self._MEMORY_SYNTHESIS_INTERVAL == 0:
+                try:
+                    self.synthesize_new_memory_node()
                 except Exception:
                     pass
             return answer, details
@@ -1406,6 +1328,35 @@ class AtlasAI:
         if save and summary:
             self.memory.add(summary, tag=tag, weight=weight, source="auto")
 
+    def synthesize_new_memory_node(self) -> None:
+        """Background synthesis: every N chat cycles, ask the LLM to distil a punchy
+        long-term insight from recent history and commit it to the vector store with
+        tag='insight' so it gets a slightly elevated engram weight."""
+        if self.llm is None:
+            return
+        recent = format_conversation(self.history[-30:])
+        synthesis_prompt = (
+            "You are a memory archivist for AtlasAI. "
+            "Read the conversation below and write ONE single punchy insight sentence "
+            "(max 25 words) that captures a durable user trait, preference trend, or "
+            "behavioural pattern worth remembering long-term. "
+            "Return ONLY that sentence, nothing else.\n\n"
+            f"Conversation:\n{recent}\n\nInsight:"
+        )
+        try:
+            result = self.llm(synthesis_prompt, max_tokens=60, temperature=0.15, stream=False)
+            if isinstance(result, dict):
+                insight = result.get("choices", [{"text": ""}])[0].get("text", "").strip()
+            else:
+                insight = str(result).strip()
+            # Strip any accidental leading labels like "Insight:" the model may echo back
+            insight = re.sub(r"^(?:insight|summary)[:\s]+", "", insight, flags=re.I).strip()
+            if insight and len(insight) > 8:
+                self.memory.add(insight, tag="insight", weight=1.6, source="synthesis")
+                print(f"[Atlas] Memory synthesis committed: {insight[:80]}")
+        except Exception as exc:
+            print(f"[Atlas] Memory synthesis skipped: {exc}")
+
     def _detect_save_intent(self, user: str) -> Optional[str]:
         """Return the text to save if the user explicitly asks Atlas to remember something."""
         lowered = user.lower().strip()
@@ -1515,42 +1466,110 @@ class AtlasAI:
         )
 
     def _render_markdown_for_gui(self, text: str) -> str:
-        import html
-        # Escape HTML first
-        text = html.escape(text)
+        import html as htmllib
 
-        # Code blocks (``` ... ```)
+        # Pull out code blocks first so we don't mangle their contents
+        code_blocks: list[str] = []
+        def stash_code_block(m: re.Match) -> str:
+            lang = m.group(1) or "plaintext"
+            code = htmllib.escape(m.group(2).rstrip())
+            block = (
+                f"<pre style='background:#0d1117; color:#c9d1d9; padding:12px; "
+                f"border-radius:6px; font-family:monospace; font-size:13px; "
+                f"white-space:pre-wrap; border:1px solid #30363d; margin:8px 0;'>"
+                f"<span style='color:#79c0ff; font-size:11px;'>{htmllib.escape(lang)}</span>\n{code}</pre>"
+            )
+            code_blocks.append(block)
+            return f"\x00CODE{len(code_blocks) - 1}\x00"
+
+        text = re.sub(r'```(\w+)?\n?(.*?)```', stash_code_block, text, flags=re.DOTALL)
+
+        # Escape remaining HTML
+        text = htmllib.escape(text)
+
+        # Escaped markdown characters (e.g. \* \_ \~)
+        text = re.sub(r'\\([*_~`#\-\[\]\\])', lambda m: f"\x01{ord(m.group(1))}\x01", text)
+
+        # Inline code
         text = re.sub(
-            r'```(\w+)?\n?(.*?)```',
-            lambda m: f"<pre style='background:#0d1117; color:#c9d1d9; padding:12px; border-radius:6px; font-family:monospace; font-size:13px; white-space:pre-wrap; border: 1px solid #30363d;'>{m.group(2)}</pre>",
-            text, flags=re.DOTALL
+            r'`([^`]+)`',
+            r"<code style='background:#1e293b; color:#60a5fa; padding:2px 6px; border-radius:3px; font-family:monospace; font-size:13px;'>\1</code>",
+            text
         )
 
-        # Inline code with better styling
-        text = re.sub(r'`([^`]+)`', r"<code style='background:#1e293b; color:#60a5fa; padding:2px 6px; border-radius:3px; font-family:monospace; font-size:13px;'>\1</code>", text)
+        # Bold + italic (*** or ___)
+        text = re.sub(r'\*\*\*(.+?)\*\*\*', r'<b><i style="color:#f0f6fc;">\1</i></b>', text)
 
-        # Bold
-        text = re.sub(r'\*\*(.+?)\*\*', r'<b style="color: #f0f6fc;">\1</b>', text)
+        # Bold (** or __)
+        text = re.sub(r'\*\*(.+?)\*\*', r'<b style="color:#f0f6fc;">\1</b>', text)
+        text = re.sub(r'__(.+?)__', r'<b style="color:#f0f6fc;">\1</b>', text)
 
-        # Italic  
-        text = re.sub(r'\*(.+?)\*', r'<i style="color: #cbd5e1;">\1</i>', text)
+        # Italic (* or _)
+        text = re.sub(r'\*(.+?)\*', r'<i style="color:#cbd5e1;">\1</i>', text)
+        text = re.sub(r'_(.+?)_', r'<i style="color:#cbd5e1;">\1</i>', text)
 
-        # Headers with better hierarchy
-        text = re.sub(r'^### (.+)$', r"<h3 style='color:#60a5fa; font-size: 15px; font-weight: 700; margin: 12px 0px 6px 0px;'>\1</h3>", text, flags=re.MULTILINE)
-        text = re.sub(r'^## (.+)$', r"<h2 style='color:#60a5fa; font-size: 18px; font-weight: 700; margin: 16px 0px 8px 0px;'>\1</h2>", text, flags=re.MULTILINE)
-        text = re.sub(r'^# (.+)$', r"<h1 style='color:#60a5fa; font-size: 20px; font-weight: 700; margin: 20px 0px 10px 0px;'>\1</h1>", text, flags=re.MULTILINE)
+        # Strikethrough
+        text = re.sub(r'~~(.+?)~~', r'<s style="color:#64748b;">\1</s>', text)
 
-        # Bullet points with better styling
-        text = re.sub(r'^\s*[-*] (.+)$', r'<li style="margin-left: 20px; margin-bottom: 4px;">\1</li>', text, flags=re.MULTILINE)
-        text = re.sub(r'(<li.*?</li>)', r'<ul style="list-style-type: disc; padding: 0px;">\1</ul>', text, flags=re.DOTALL)
+        # Headers (h3 before h2 before h1 to avoid greedy overlap)
+        text = re.sub(r'^### (.+)$', r"<h3 style='color:#60a5fa; font-size:15px; font-weight:700; margin:12px 0 6px 0;'>\1</h3>", text, flags=re.MULTILINE)
+        text = re.sub(r'^## (.+)$',  r"<h2 style='color:#60a5fa; font-size:18px; font-weight:700; margin:16px 0 8px 0;'>\1</h2>", text, flags=re.MULTILINE)
+        text = re.sub(r'^# (.+)$',   r"<h1 style='color:#60a5fa; font-size:20px; font-weight:700; margin:20px 0 10px 0;'>\1</h1>", text, flags=re.MULTILINE)
+
+        # Horizontal rules
+        text = re.sub(r'^(?:---|\*\*\*|___)\s*$', r"<hr style='border:none; border-top:1px solid #334155; margin:12px 0;'>", text, flags=re.MULTILINE)
 
         # Blockquotes
-        text = re.sub(r'^&gt; (.+)$', r"<blockquote style='border-left: 3px solid #60a5fa; padding-left: 12px; color: #cbd5e1; margin: 8px 0px; font-style: italic;'>\1</blockquote>", text, flags=re.MULTILINE)
+        text = re.sub(
+            r'^&gt; (.+)$',
+            r"<blockquote style='border-left:3px solid #60a5fa; padding-left:12px; color:#cbd5e1; margin:8px 0; font-style:italic;'>\1</blockquote>",
+            text, flags=re.MULTILINE
+        )
+
+        # Tables  |col|col|
+        def render_table(m: re.Match) -> str:
+            rows = [r.strip() for r in m.group(0).strip().splitlines() if r.strip()]
+            html_rows = []
+            for i, row in enumerate(rows):
+                if re.match(r'^[\|\s\-:]+$', row):
+                    continue
+                cells = [c.strip() for c in row.strip('|').split('|')]
+                tag = 'th' if i == 0 else 'td'
+                style = "style='padding:6px 12px; border:1px solid #334155; color:#e2e8f0;'"
+                html_rows.append('<tr>' + ''.join(f'<{tag} {style}>{c}</{tag}>' for c in cells) + '</tr>')
+            return (
+                "<table style='border-collapse:collapse; margin:8px 0; font-size:14px;'>"
+                + ''.join(html_rows)
+                + "</table>"
+            )
+        text = re.sub(r'((?:^\|.+\|\s*\n?)+)', render_table, text, flags=re.MULTILINE)
+
+        # Numbered lists — group consecutive items into one <ol>
+        def render_ol(m: re.Match) -> str:
+            items = re.findall(r'^\d+\. (.+)$', m.group(0), flags=re.MULTILINE)
+            lis = ''.join(f'<li style="margin-left:20px; margin-bottom:4px;">{item}</li>' for item in items)
+            return f"<ol style='padding:0; margin:4px 0;'>{lis}</ol>"
+        text = re.sub(r'((?:^\d+\. .+\n?)+)', render_ol, text, flags=re.MULTILINE)
+
+        # Bullet lists — group consecutive items into one <ul>
+        def render_ul(m: re.Match) -> str:
+            items = re.findall(r'^\s*[-*] (.+)$', m.group(0), flags=re.MULTILINE)
+            lis = ''.join(f'<li style="margin-left:20px; margin-bottom:4px;">{item}</li>' for item in items)
+            return f"<ul style='list-style-type:disc; padding:0; margin:4px 0;'>{lis}</ul>"
+        text = re.sub(r'((?:^\s*[-*] .+\n?)+)', render_ul, text, flags=re.MULTILINE)
 
         # Links
-        text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2" style="color: #60a5fa; text-decoration: underline;">\1</a>', text)
+        text = re.sub(r'\[(.+?)\]\((.+?)\)', r'<a href="\2" style="color:#60a5fa; text-decoration:underline;">\1</a>', text)
 
-        # Newlines (outside of pre blocks)
+        # Restore escaped characters
+        text = re.sub(r'\x01(\d+)\x01', lambda m: chr(int(m.group(1))), text)
+
+        # Restore code blocks
+        def restore_code(m: re.Match) -> str:
+            return code_blocks[int(m.group(1))]
+        text = re.sub(r'\x00CODE(\d+)\x00', restore_code, text)
+
+        # Newlines to <br> (skip inside block elements)
         text = re.sub(r'\n', '<br>', text)
 
         return text
@@ -1572,97 +1591,77 @@ if _HAS_QT:
             except Exception as exc:
                 self.error_occurred.emit(str(exc))
 
-    class MessageWidget(QWidget):
+    class ChatBubble(QWidget):
         def __init__(self, assistant: "AtlasAI", role: str, text: str, details: str = ""):
             super().__init__()
             self.assistant = assistant
             self.role = role.lower()
-            self.setAttribute(Qt.WA_StyledBackground, True)
-
-            outer = QVBoxLayout(self)
-            outer.setContentsMargins(0, 0, 0, 0)
-            outer.setSpacing(0)
-
-            # Alternating background
+            
+            # Create a container layout that handles left/right alignment
+            container_layout = QHBoxLayout(self)
+            container_layout.setContentsMargins(0, 0, 0, 0)
+            container_layout.setSpacing(0)
+            
+            # Add stretch to left or right depending on role
+            if self.role != "atlas":
+                container_layout.addStretch()
+            
+            # Main message bubble
+            bubble_widget = QWidget()
+            bubble_layout = QVBoxLayout(bubble_widget)
+            bubble_layout.setSpacing(8)
+            bubble_layout.setContentsMargins(16, 14, 16, 14)
+            
+            # Role indicator
+            role_label = QLabel(role)
             if self.role == "atlas":
-                self.setStyleSheet("QWidget#msgWidget { background: #1a1a2e; }")
+                role_label.setStyleSheet("color: #60a5fa; font-weight: 700; font-size: 13px; margin-bottom: 2px;")
             else:
-                self.setStyleSheet("QWidget#msgWidget { background: transparent; }")
-            self.setObjectName("msgWidget")
-
-            # Inner content constrained to max width
-            inner_wrap = QWidget()
-            inner_wrap.setStyleSheet("background: transparent;")
-            inner_layout = QHBoxLayout(inner_wrap)
-            inner_layout.setContentsMargins(24, 20, 24, 20)
-            inner_layout.setSpacing(16)
-
-            # Avatar circle
-            avatar = QLabel("A" if self.role == "atlas" else "Y")
-            avatar.setFixedSize(36, 36)
-            avatar.setAlignment(Qt.AlignCenter)
-            if self.role == "atlas":
-                avatar.setStyleSheet(
-                    "background: qlineargradient(x1:0,y1:0,x2:1,y2:1,stop:0 #7c3aed,stop:1 #4f46e5);"
-                    "border-radius: 18px; color: white; font-weight: 700; font-size: 14px;"
-                )
-            else:
-                avatar.setStyleSheet(
-                    "background: #374151; border-radius: 18px; color: #d1d5db;"
-                    "font-weight: 700; font-size: 14px;"
-                )
-            inner_layout.addWidget(avatar, 0, Qt.AlignTop)
-
+                role_label.setStyleSheet("color: #94a3b8; font-weight: 700; font-size: 13px; margin-bottom: 2px;")
+            bubble_layout.addWidget(role_label)
+            
             # Message content
-            content_widget = QWidget()
-            content_widget.setStyleSheet("background: transparent;")
-            content_layout = QVBoxLayout(content_widget)
-            content_layout.setContentsMargins(0, 0, 0, 0)
-            content_layout.setSpacing(8)
-
-            # Role label
-            role_label = QLabel("Atlas" if self.role == "atlas" else "You")
-            role_label.setStyleSheet(
-                "font-weight: 700; font-size: 13px; color: #9ca3af; background: transparent;"
-            )
-            content_layout.addWidget(role_label)
-
-            # Message body
-            for widget in self._render_content(text):
-                content_layout.addWidget(widget)
-
+            for widget in self._render_message(text):
+                bubble_layout.addWidget(widget)
+            
             # Details toggle
             if details:
-                toggle_btn = QPushButton("▶ Show reasoning")
-                toggle_btn.setStyleSheet(
-                    "QPushButton { background: transparent; color: #6b7280; border: none;"
-                    "font-size: 12px; text-align: left; padding: 2px 0; }"
-                    "QPushButton:hover { color: #9ca3af; }"
+                self.toggle_button = QPushButton("Show details")
+                self.toggle_button.setStyleSheet(
+                    "QPushButton { background: #334155; color: #cbd5e1; border-radius: 4px; padding: 4px 8px; font-size: 12px; }"
+                    "QPushButton:hover { background: #475569; }"
                 )
-                toggle_btn.setMaximumWidth(160)
-                details_widget = QWidget()
-                details_widget.setStyleSheet(
-                    "background: #111827; border-left: 2px solid #374151;"
-                    "border-radius: 0 4px 4px 0; padding: 8px;"
+                self.toggle_button.setMaximumWidth(100)
+                self.details_container = QWidget()
+                details_layout = QVBoxLayout(self.details_container)
+                details_layout.setContentsMargins(0, 0, 0, 0)
+                for widget in self._render_message(details):
+                    details_layout.addWidget(widget)
+                self.details_container.setVisible(False)
+                self.toggle_button.clicked.connect(self._toggle_details)
+                bubble_layout.addWidget(self.toggle_button)
+                bubble_layout.addWidget(self.details_container)
+            
+            # Bubble styling based on role
+            if self.role == "atlas":
+                bubble_widget.setStyleSheet(
+                    "QWidget { border-radius: 12px; background: #1e293b; border: 1px solid #334155; margin: 8px 0px 8px 24px; }"
                 )
-                details_layout = QVBoxLayout(details_widget)
-                details_layout.setContentsMargins(12, 8, 8, 8)
-                for w in self._render_content(details):
-                    details_layout.addWidget(w)
-                details_widget.setVisible(False)
-                toggle_btn.clicked.connect(lambda _, dw=details_widget, tb=toggle_btn: (
-                    dw.setVisible(not dw.isVisible()),
-                    tb.setText("▼ Hide reasoning" if dw.isVisible() else "▶ Show reasoning")
-                ))
-                content_layout.addWidget(toggle_btn)
-                content_layout.addWidget(details_widget)
+            else:
+                bubble_widget.setStyleSheet(
+                    "QWidget { border-radius: 12px; background: #2563eb; border: none; margin: 8px 24px 8px 0px; }"
+                )
+            
+            container_layout.addWidget(bubble_widget, 0, Qt.AlignTop)
+            
+            # Add stretch to right or left depending on role
+            if self.role == "atlas":
+                container_layout.addStretch() 
 
-            inner_layout.addWidget(content_widget, 1)
-            outer.addWidget(inner_wrap)
-
-        def _render_content(self, text: str) -> list:
+        def _render_message(self, text: str) -> list:
             import html as htmllib
             widgets = []
+            # Split on code blocks
             parts = re.split(r'(```(?:\w+)?\n?.*?```)', text, flags=re.DOTALL)
             for part in parts:
                 code_match = re.match(r'```(\w+)?\n?(.*?)```', part, flags=re.DOTALL)
@@ -1670,409 +1669,490 @@ if _HAS_QT:
                     lang = code_match.group(1) or "plaintext"
                     code = code_match.group(2).rstrip()
 
+                    # Wrapper widget for code block
                     wrapper = QWidget()
-                    wrapper.setStyleSheet("background: transparent; margin: 4px 0;")
-                    wl = QVBoxLayout(wrapper)
-                    wl.setContentsMargins(0, 4, 0, 4)
-                    wl.setSpacing(0)
+                    wrapper.setStyleSheet("QWidget { background: transparent; margin: 12px 0px; }")
+                    wrapper_layout = QVBoxLayout(wrapper)
+                    wrapper_layout.setContentsMargins(0, 0, 0, 0)
+                    wrapper_layout.setSpacing(0)
 
-                    topbar = QWidget()
-                    topbar.setStyleSheet(
-                        "background: #1f2937; border-radius: 8px 8px 0 0;"
-                        "border-bottom: 1px solid #374151;"
-                    )
-                    tbl = QHBoxLayout(topbar)
-                    tbl.setContentsMargins(14, 8, 14, 8)
-
-                    lang_lbl = QLabel(lang)
-                    lang_lbl.setStyleSheet("color: #6b7280; font-size: 11px; font-family: monospace; background: transparent;")
-                    tbl.addWidget(lang_lbl)
-                    tbl.addStretch()
-
+                    # Top bar with language label and copy button
+                    top_bar = QWidget()
+                    top_bar.setStyleSheet("QWidget { background: #0d1117; border-radius: 6px 6px 0px 0px; border-bottom: 1px solid #30363d; }")
+                    top_bar_layout = QHBoxLayout(top_bar)
+                    top_bar_layout.setContentsMargins(12, 8, 12, 8)
+                    
+                    lang_label = QLabel(lang)
+                    lang_label.setStyleSheet("color: #79c0ff; font-size: 11px; font-weight: 600; font-family: monospace;")
+                    top_bar_layout.addWidget(lang_label)
+                    top_bar_layout.addStretch()
+                    
                     copy_btn = QPushButton("Copy")
-                    copy_btn.setFixedSize(54, 24)
+                    copy_btn.setFixedSize(60, 28)
                     copy_btn.setStyleSheet(
-                        "QPushButton { background: #374151; color: #d1d5db; border-radius: 4px;"
-                        "font-size: 11px; border: none; }"
-                        "QPushButton:hover { background: #4b5563; }"
+                        "QPushButton { background: #238636; color: #f0f6fc; border-radius: 4px; font-size: 12px; padding: 2px; font-weight: 600; border: none; }"
+                        "QPushButton:hover { background: #2da644; }"
                     )
-                    copy_btn.clicked.connect(lambda _, c=code, b=copy_btn: self._copy(c, b))
-                    tbl.addWidget(copy_btn)
-                    wl.addWidget(topbar)
+                    copy_btn.clicked.connect(lambda checked, c=code: self._copy_code(c, copy_btn))
+                    top_bar_layout.addWidget(copy_btn)
+                    wrapper_layout.addWidget(top_bar)
 
+                    # Code text area
                     code_edit = QTextEdit()
                     code_edit.setReadOnly(True)
                     code_edit.setPlainText(code)
                     code_edit.setStyleSheet(
-                        "QTextEdit { background: #111827; color: #e5e7eb; font-family: 'Consolas','Monaco','Courier New',monospace;"
-                        "font-size: 13px; border-radius: 0 0 8px 8px; border: none; padding: 12px; }"
+                        "QTextEdit { background-color: #0d1117 !important; color: #c9d1d9 !important; "
+                        "font-family: 'Consolas', 'Monaco', 'Courier New', monospace; font-size: 12px; "
+                        "border-radius: 0px 0px 6px 6px; border: none; padding: 12px; line-height: 1.5; }"
                     )
-                    lines = code.count('\n') + 1
-                    code_edit.setFixedHeight(min(lines * 20 + 28, 480))
-                    wl.addWidget(code_edit)
+                    code_edit.setMinimumHeight(80)
+                    code_edit.setMaximumHeight(500)
+                    code_edit.document().contentsChanged.connect(
+                        lambda: code_edit.setFixedHeight(
+                            min(int(code_edit.document().size().height()) + 24, 500)
+                        )
+                    )
+                    wrapper_layout.addWidget(code_edit)
                     widgets.append(wrapper)
                 else:
                     if not part.strip():
                         continue
-                    rendered = self.assistant._render_markdown_for_gui(part)
-                    lbl = QLabel(f"<div style='font-size:14px; color:#d1d5db; line-height:1.75;'>{rendered}</div>")
-                    lbl.setTextFormat(Qt.RichText)
-                    lbl.setWordWrap(True)
-                    lbl.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
-                    lbl.setStyleSheet("background: transparent; border: none;")
-                    widgets.append(lbl)
+                    rendered = self.assistant._render_markdown_for_gui(part) if hasattr(self.assistant, '_render_markdown_for_gui') else htmllib.escape(part).replace('\n', '<br>')
+                    label = QLabel(f"<div style='font-size:15px; color:#e2e8f0; line-height:1.8; letter-spacing: 0.2px;'>{rendered}</div>")
+                    label.setTextFormat(Qt.RichText)
+                    label.setWordWrap(True)
+                    label.setTextInteractionFlags(Qt.TextSelectableByMouse | Qt.LinksAccessibleByMouse)
+                    widgets.append(label)
             return widgets
 
-        def _copy(self, code: str, btn: "QPushButton") -> None:
+        def _copy_code(self, code: str, button: "QPushButton") -> None:
             QApplication.clipboard().setText(code)
-            btn.setText("✓")
-            QTimer.singleShot(2000, lambda: btn.setText("Copy"))
+            original_text = button.text()
+            button.setText("✓ Copied")
+            button.setStyleSheet(
+                "QPushButton { background: #238636; color: #f0f6fc; border-radius: 4px; font-size: 12px; padding: 2px; font-weight: 600; border: none; }"
+            )
+            QTimer.singleShot(2000, lambda: (button.setText(original_text), button.setStyleSheet(
+                "QPushButton { background: #238636; color: #f0f6fc; border-radius: 4px; font-size: 12px; padding: 2px; font-weight: 600; border: none; }"
+                "QPushButton:hover { background: #2da644; }"
+            )))
 
+        def _toggle_details(self) -> None:
+            visible = not self.details_container.isVisible()
+            self.details_container.setVisible(visible)
+            self.toggle_button.setText("Hide details" if visible else "Show details")
+
+
+    class DraggableMemoryListWidget(QListWidget):
+        """A QListWidget whose items can be dragged out as [Context Note: …] text injects."""
+
+        def __init__(self, parent=None):
+            super().__init__(parent)
+            self.setDragEnabled(True)
+            self.setSelectionMode(QListWidget.SingleSelection)
+            self.setStyleSheet(
+                "QListWidget { background: #1e293b; color: #e2e8f0; border: none; "
+                "border-radius: 6px; font-size: 13px; }"
+                "QListWidget::item { padding: 6px 10px; border-bottom: 1px solid #334155; }"
+                "QListWidget::item:selected { background: #334155; color: #f8fafc; }"
+                "QListWidget::item:hover { background: #263548; }"
+            )
+
+        def startDrag(self, supported_actions) -> None:  # type: ignore[override]
+            item = self.currentItem()
+            if item is None:
+                return
+            raw_text = item.data(Qt.UserRole) or item.text()
+            inject_text = f"[Context Note: {raw_text}]"
+
+            mime = QMimeData()
+            mime.setText(inject_text)
+
+            drag = QDrag(self)
+            drag.setMimeData(mime)
+            drag.exec(Qt.CopyAction)
+
+    class MemoryInsightWindow(QWidget):
+        """Floating panel showing memory engrams; items can be dragged into the chat input."""
+
+        def __init__(self, assistant: "AtlasAI", parent=None):
+            super().__init__(parent, Qt.Window | Qt.Tool)
+            self.assistant = assistant
+            self.setWindowTitle("Memory Engrams")
+            self.resize(420, 480)
+            self.setMinimumSize(320, 260)
+            self.setStyleSheet(
+                "QWidget { background: #0f172a; color: #e2e8f0; }"
+                "QPushButton { background: #3b82f6; color: #fff; border-radius: 6px; "
+                "padding: 6px 12px; font-weight: 600; border: none; }"
+                "QPushButton:hover { background: #2563eb; }"
+            )
+
+            layout = QVBoxLayout(self)
+            layout.setContentsMargins(12, 12, 12, 12)
+            layout.setSpacing(8)
+
+            # Header row
+            header = QHBoxLayout()
+            title = QLabel("🧠 Memory Engrams")
+            title.setStyleSheet("font-size: 16px; font-weight: 700; color: #f8fafc;")
+            hint = QLabel("Drag any entry into the chat input")
+            hint.setStyleSheet("font-size: 11px; color: #64748b;")
+            refresh_btn = QPushButton("Refresh")
+            refresh_btn.setFixedHeight(28)
+            refresh_btn.clicked.connect(self.populate)
+            header.addWidget(title)
+            header.addStretch()
+            header.addWidget(refresh_btn)
+            layout.addLayout(header)
+            layout.addWidget(hint)
+
+            sep = QFrame()
+            sep.setFrameShape(QFrame.HLine)
+            sep.setStyleSheet("color: #334155;")
+            layout.addWidget(sep)
+
+            self.list_widget = DraggableMemoryListWidget()
+            layout.addWidget(self.list_widget)
+
+            self.status_label = QLabel("")
+            self.status_label.setStyleSheet("font-size: 11px; color: #64748b;")
+            layout.addWidget(self.status_label)
+
+            self.populate()
+
+        def populate(self) -> None:
+            self.list_widget.clear()
+            entries = self.assistant.memory.entries
+            if not entries:
+                item = QListWidgetItem("(memory is empty)")
+                item.setFlags(item.flags() & ~Qt.ItemIsEnabled)
+                self.list_widget.addItem(item)
+                self.status_label.setText("0 engrams")
+                return
+
+            now = time.time()
+            scored = []
+            for entry in entries:
+                age = now - entry.get("timestamp", now)
+                decay = math.exp(-age / HALF_LIFE_SECONDS)
+                type_weight = ENGRAM_TYPE_WEIGHTS.get(entry.get("tag", "fact"), 1.0)
+                score = float(entry.get("weight", 1.0)) * type_weight * decay
+                scored.append((score, entry))
+            scored.sort(reverse=True, key=lambda x: x[0])
+
+            for score, entry in scored:
+                tag = entry.get("tag", "fact")
+                text = entry.get("text", "").strip()
+                if not text:
+                    continue
+                display = f"[{tag}] {text}"
+                item = QListWidgetItem(display)
+                item.setData(Qt.UserRole, text)  # raw text for the inject
+                item.setToolTip(
+                    f"Tag: {tag}  |  Score: {score:.3f}  |  "
+                    f"Age: {int((now - entry.get('timestamp', now)) / 3600)}h\n"
+                    "Drag into chat input to inject as [Context Note: …]"
+                )
+                self.list_widget.addItem(item)
+
+            self.status_label.setText(f"{len(scored)} engrams — sorted by relevance score")
 
     class AtlasGUI(QWidget):
         def __init__(self, assistant: AtlasAI):
             super().__init__()
             self.assistant = assistant
-            self.worker = None
-            self.setWindowTitle("Atlas")
-            self.setGeometry(100, 80, 1100, 700)
-            self.setMinimumSize(800, 500)
-
-            self.setStyleSheet("""
-                QWidget { background: #111827; color: #f9fafb; font-family: 'Inter', 'Segoe UI', sans-serif; }
-                QPushButton { background: #7c3aed; color: white; border-radius: 8px; padding: 8px 16px; font-weight: 600; border: none; font-size: 13px; }
-                QPushButton:hover { background: #6d28d9; }
-                QPushButton:pressed { background: #5b21b6; }
-                QPushButton:disabled { background: #374151; color: #6b7280; }
-                QLineEdit { background: #1f2937; color: #f9fafb; border: 1px solid #374151; border-radius: 12px; padding: 12px 16px; font-size: 14px; }
-                QLineEdit:focus { border: 1px solid #7c3aed; }
-                QScrollArea { border: none; background: transparent; }
-                QScrollBar:vertical { background: transparent; width: 6px; margin: 0; }
-                QScrollBar::handle:vertical { background: #374151; border-radius: 3px; min-height: 20px; }
-                QScrollBar::handle:vertical:hover { background: #4b5563; }
-                QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
-                QMenuBar { background: #1f2937; color: #9ca3af; border: none; font-size: 13px; }
-                QMenuBar::item:selected { background: #374151; border-radius: 4px; }
-                QMenu { background: #1f2937; color: #f9fafb; border: 1px solid #374151; border-radius: 8px; }
-                QMenu::item:selected { background: #374151; border-radius: 4px; }
-                QTextEdit { background: #1f2937; color: #f9fafb; border: 1px solid #374151; border-radius: 8px; }
-                QLabel { background: transparent; }
-            """)
-
-            root = QHBoxLayout(self)
-            root.setContentsMargins(0, 0, 0, 0)
-            root.setSpacing(0)
-
-            # ── Sidebar ──────────────────────────────────────────────
-            sidebar = QWidget()
-            sidebar.setFixedWidth(260)
-            sidebar.setStyleSheet("QWidget { background: #1f2937; border-right: 1px solid #374151; }")
-            sidebar_layout = QVBoxLayout(sidebar)
-            sidebar_layout.setContentsMargins(12, 16, 12, 16)
-            sidebar_layout.setSpacing(8)
-
-            # Atlas logo + name
-            logo_row = QHBoxLayout()
-            logo_icon = QLabel("◈")
-            logo_icon.setStyleSheet(
-                "font-size: 22px; color: #7c3aed; background: transparent;"
+            self.setWindowTitle("Atlas AI")
+            self.setGeometry(120, 80, 900, 600)
+            self.setMinimumSize(720, 500)
+            
+            # ChatGPT-inspired dark theme with Claude's polish
+            self.setStyleSheet(
+                "QWidget { background: #0f172a; color: #e2e8f0; }"
+                "QPushButton { background: #3b82f6; color: #ffffff; border-radius: 6px; padding: 8px 14px; font-weight: 600; border: none; }"
+                "QPushButton:hover { background: #2563eb; }"
+                "QPushButton:pressed { background: #1d4ed8; }"
+                "QLineEdit { background: #1e293b; color: #f8fafc; border: 1px solid #475569; border-radius: 8px; padding: 10px 14px; }"
+                "QLineEdit:focus { border: 2px solid #3b82f6; }"
+                "QLabel { color: #e2e8f0; }"
+                "QMenuBar { background: #0f172a; color: #cbd5e1; border-bottom: 1px solid #1e293b; }"
+                "QMenuBar::item:selected { background: #1e293b; }"
+                "QMenu { background: #1e293b; color: #e2e8f0; border: 1px solid #334155; }"
+                "QMenu::item:selected { background: #334155; }"
             )
-            logo_name = QLabel("Atlas")
-            logo_name.setStyleSheet("font-size: 18px; font-weight: 700; color: #f9fafb; background: transparent;")
-            logo_row.addWidget(logo_icon)
-            logo_row.addWidget(logo_name)
-            logo_row.addStretch()
-            sidebar_layout.addLayout(logo_row)
 
-            # New chat button
-            new_chat_btn = QPushButton("+ New chat")
-            new_chat_btn.setStyleSheet(
-                "QPushButton { background: #374151; color: #f9fafb; border-radius: 8px;"
-                "padding: 10px 14px; font-size: 13px; text-align: left; border: 1px solid #4b5563; }"
-                "QPushButton:hover { background: #4b5563; }"
-            )
-            new_chat_btn.clicked.connect(self._on_new_chat)
-            sidebar_layout.addWidget(new_chat_btn)
+            outer_layout = QVBoxLayout(self)
+            outer_layout.setContentsMargins(0, 0, 0, 0)
+            outer_layout.setSpacing(0)
+            
+            # Header with title and model info
+            header_widget = QWidget()
+            header_widget.setStyleSheet("QWidget { background: #0f172a; border-bottom: 1px solid #1e293b; }")
+            header_layout = QVBoxLayout(header_widget)
+            header_layout.setContentsMargins(16, 12, 16, 12)
+            header_layout.setSpacing(4)
+            
+            title_label = QLabel("Atlas")
+            title_label.setStyleSheet("font-size: 24px; font-weight: 700; color: #f8fafc;")
+            
+            subtitle_layout = QHBoxLayout()
+            model_name = os.path.basename(self.assistant.model_path) if self.assistant.model_path else "No model loaded"
+            subtitle_label = QLabel(model_name[:40])
+            subtitle_label.setStyleSheet("color: #94a3b8; font-size: 12px;")
+            subtitle_layout.addWidget(subtitle_label)
+            subtitle_layout.addStretch()
+            
+            header_layout.addWidget(title_label)
+            header_layout.addLayout(subtitle_layout)
+            outer_layout.addWidget(header_widget)
 
-            sidebar_layout.addSpacing(8)
-
-            # Chats label
-            chats_label = QLabel("Chats")
-            chats_label.setStyleSheet("color: #6b7280; font-size: 11px; font-weight: 600; letter-spacing: 1px; background: transparent;")
-            sidebar_layout.addWidget(chats_label)
-
-            # Chat list scroll area
-            chat_list_scroll = QScrollArea()
-            chat_list_scroll.setWidgetResizable(True)
-            chat_list_scroll.setStyleSheet("QScrollArea { background: transparent; border: none; }")
-            self.chat_list_widget = QWidget()
-            self.chat_list_widget.setStyleSheet("background: transparent;")
-            self.chat_list_layout = QVBoxLayout(self.chat_list_widget)
-            self.chat_list_layout.setContentsMargins(0, 0, 0, 0)
-            self.chat_list_layout.setSpacing(2)
-            self.chat_list_layout.addStretch()
-            chat_list_scroll.setWidget(self.chat_list_widget)
-            sidebar_layout.addWidget(chat_list_scroll, 1)
-
-            sidebar_layout.addSpacing(8)
-
-            # Model info at bottom of sidebar
-            self.model_label = QLabel(
-                os.path.basename(self.assistant.model_path)[:28]
-                if self.assistant.model_path else "No model loaded"
-            )
-            self.model_label.setStyleSheet(
-                "color: #6b7280; font-size: 11px; background: #111827;"
-                "border-radius: 6px; padding: 6px 10px;"
-            )
-            self.model_label.setWordWrap(True)
-            sidebar_layout.addWidget(self.model_label)
-
-            # Load model button
-            load_model_btn = QPushButton("⬡ Load model")
-            load_model_btn.setStyleSheet(
-                "QPushButton { background: transparent; color: #9ca3af; border: 1px solid #374151;"
-                "border-radius: 8px; padding: 8px 12px; font-size: 12px; text-align: left; }"
-                "QPushButton:hover { background: #374151; color: #f9fafb; }"
-            )
-            load_model_btn.clicked.connect(self._on_load_model_dialog)
-            sidebar_layout.addWidget(load_model_btn)
-
-            root.addWidget(sidebar)
-
-            # ── Main area ────────────────────────────────────────────
-            main_area = QWidget()
-            main_area.setStyleSheet("background: #111827;")
-            main_layout = QVBoxLayout(main_area)
-            main_layout.setContentsMargins(0, 0, 0, 0)
-            main_layout.setSpacing(0)
-
-            # Thin top bar with menu
-            topbar = QWidget()
-            topbar.setFixedHeight(40)
-            topbar.setStyleSheet("background: #111827; border-bottom: 1px solid #1f2937;")
-            topbar_layout = QHBoxLayout(topbar)
-            topbar_layout.setContentsMargins(16, 0, 16, 0)
-
+            # Menu bar
             menubar = QMenuBar()
-            menubar.setStyleSheet(
-                "QMenuBar { background: transparent; color: #6b7280; border: none; font-size: 13px; }"
-                "QMenuBar::item:selected { background: #1f2937; border-radius: 4px; color: #f9fafb; }"
-            )
-            chat_menu = menubar.addMenu("Chats")
-            action_save_as = QAction("Save chat as…", self)
-            action_save_as.triggered.connect(self._on_save_chat_as)
-            chat_menu.addAction(action_save_as)
-            action_load = QAction("Load chat…", self)
-            action_load.triggered.connect(self._on_load_chat)
-            chat_menu.addAction(action_load)
-
+            menubar.setMinimumHeight(24)
+            menubar.setStyleSheet("QMenuBar { background: #0f172a; color: #cbd5e1; border: none; padding: 0px 16px; }")
+            file_menu = menubar.addMenu("File")
+            self.chat_menu = menubar.addMenu("Chats")
+            self.action_save_chat = QAction("Save Chat As...", self)
+            self.action_save_chat.triggered.connect(self._on_save_chat_as)
+            self.chat_menu.addAction(self.action_save_chat)
+            self.action_load_chat = QAction("Load Chat...", self)
+            self.action_load_chat.triggered.connect(self._on_load_chat)
+            self.chat_menu.addAction(self.action_load_chat)
+            self.chat_menu.addSeparator()
+            self.action_new_chat = QAction("New Chat", self)
+            self.action_new_chat.triggered.connect(self._on_new_chat)
+            self.chat_menu.addAction(self.action_new_chat)
+            self.chat_menu.addSeparator()
+            self.action_save_chat_history = QAction("Save Current Chat", self)
+            self.action_save_chat_history.triggered.connect(self._on_save_chat)
+            self.chat_menu.addAction(self.action_save_chat_history)
             self.model_menu = menubar.addMenu("Model")
             self._populate_model_menu()
-
             debug_menu = menubar.addMenu("Debug")
-            self.action_show_debug = QAction("Debug panel", self)
+            self.action_show_debug = QAction("Show Debug Panel", self)
             self.action_show_debug.setCheckable(True)
-            self.action_show_debug.toggled.connect(self._toggle_debug)
+            self.action_show_debug.toggled.connect(self._toggle_debug_panel)
             debug_menu.addAction(self.action_show_debug)
 
-            topbar_layout.addWidget(menubar)
-            topbar_layout.addStretch()
+            # Memory Insight Window
+            memory_menu = menubar.addMenu("Memory")
+            self.action_show_memory_panel = QAction("Show Engram Panel", self)
+            self.action_show_memory_panel.setCheckable(True)
+            self.action_show_memory_panel.toggled.connect(self._toggle_memory_panel)
+            memory_menu.addAction(self.action_show_memory_panel)
+            self._memory_insight_window: Optional["MemoryInsightWindow"] = None
 
-            self.status_label = QLabel("")
-            self.status_label.setStyleSheet("color: #6b7280; font-size: 12px; background: transparent;")
-            topbar_layout.addWidget(self.status_label)
+            outer_layout.addWidget(menubar)
 
-            main_layout.addWidget(topbar)
-
-            # Chat scroll area
-            self.scroll_area = QScrollArea()
-            self.scroll_area.setWidgetResizable(True)
-            self.scroll_area.setStyleSheet("QScrollArea { background: #111827; border: none; }")
-
-            self.chat_container = QWidget()
-            self.chat_container.setStyleSheet("background: #111827;")
-            self.chat_layout = QVBoxLayout(self.chat_container)
-            self.chat_layout.setContentsMargins(0, 0, 0, 0)
-            self.chat_layout.setSpacing(0)
-            self.chat_layout.addStretch()
-            self.scroll_area.setWidget(self.chat_container)
-            main_layout.addWidget(self.scroll_area, 1)
-
-            # Input area
-            input_container = QWidget()
-            input_container.setStyleSheet("background: #111827; border-top: 1px solid #1f2937;")
-            input_outer = QVBoxLayout(input_container)
-            input_outer.setContentsMargins(0, 12, 0, 20)
-            input_outer.setSpacing(0)
-
-            input_inner = QWidget()
-            input_inner.setMaximumWidth(760)
-            input_inner.setStyleSheet("background: transparent;")
-            input_inner_layout = QHBoxLayout(input_inner)
-            input_inner_layout.setContentsMargins(0, 0, 0, 0)
-            input_inner_layout.setSpacing(10)
-
-            self.input_line = QLineEdit()
-            self.input_line.setPlaceholderText("Message Atlas…")
-            self.input_line.setMinimumHeight(48)
-            self.input_line.returnPressed.connect(self.on_send)
-            input_inner_layout.addWidget(self.input_line)
-
-            self.send_button = QPushButton("↑")
-            self.send_button.setFixedSize(48, 48)
-            self.send_button.setStyleSheet(
-                "QPushButton { background: #7c3aed; color: white; border-radius: 24px;"
-                "font-size: 18px; font-weight: 700; border: none; }"
-                "QPushButton:hover { background: #6d28d9; }"
-                "QPushButton:disabled { background: #374151; color: #4b5563; }"
-            )
-            self.send_button.clicked.connect(self.on_send)
-            input_inner_layout.addWidget(self.send_button)
-
-            input_outer.addWidget(input_inner, 0, Qt.AlignHCenter)
-            main_layout.addWidget(input_container)
-
-            root.addWidget(main_area, 1)
-
-            # Debug dialog
             self.debug_dialog = QDialog(self)
             self.debug_dialog.setWindowTitle("Atlas Debug")
-            self.debug_dialog.resize(720, 500)
-            dl = QVBoxLayout(self.debug_dialog)
+            self.debug_dialog.resize(700, 500)
+            debug_layout = QVBoxLayout(self.debug_dialog)
             self.debug_text = QTextEdit()
             self.debug_text.setReadOnly(True)
-            dl.addWidget(self.debug_text)
+            debug_layout.addWidget(self.debug_text)
+            self.debug_dialog.setLayout(debug_layout)
 
-            self._refresh_chat_list()
-            self._append_message("Atlas", "Hey! I'm Atlas. Load a model and ask me anything.")
-            # Memory management button
-            self.brain_btn = QPushButton("Manage Memories", self)
-            self.brain_btn.clicked.connect(self.open_memory_hub)
+            # Chat area with clean scrolling
+            self.scroll_area = QScrollArea()
+            self.scroll_area.setWidgetResizable(True)
+            self.scroll_area.setStyleSheet("QScrollArea { border: none; background: #0f172a; }")
+            self.scroll_area.verticalScrollBar().setStyleSheet(
+                "QScrollBar:vertical { background: #0f172a; width: 8px; }"
+                "QScrollBar::handle:vertical { background: #475569; border-radius: 4px; }"
+                "QScrollBar::handle:vertical:hover { background: #64748b; }"
+            )
+            
+            self.chat_container = QWidget()
+            self.chat_container.setStyleSheet("QWidget { background: #0f172a; }")
+            self.chat_layout = QVBoxLayout(self.chat_container)
+            self.chat_layout.setContentsMargins(16, 16, 16, 16)
+            self.chat_layout.setSpacing(16)
+            self.chat_layout.addStretch()
+            self.scroll_area.setWidget(self.chat_container)
 
-        def _append_message(self, role: str, text: str, details: str = "") -> None:
-            msg = MessageWidget(self.assistant, role, text, details)
-            self.chat_layout.insertWidget(self.chat_layout.count() - 1, msg)
+            # Input area with better styling
+            input_widget = QWidget()
+            input_widget.setStyleSheet("QWidget { background: #0f172a; border-top: 1px solid #1e293b; }")
+            input_layout = QVBoxLayout(input_widget)
+            input_layout.setContentsMargins(16, 12, 16, 16)
+            input_layout.setSpacing(8)
+            
+            input_field_layout = QHBoxLayout()
+            input_field_layout.setContentsMargins(0, 0, 0, 0)
+            input_field_layout.setSpacing(8)
+
+            # DragDropLineEdit — accepts [Context Note: …] text dropped from MemoryInsightWindow
+            class DragDropLineEdit(QLineEdit):
+                def customDragEnterEvent(self, event) -> None:  # type: ignore[override]
+                    if event.mimeData().hasText():
+                        text = event.mimeData().text()
+                        if text.startswith("[Context Note:"):
+                            event.acceptProposedAction()
+                            self.setStyleSheet(
+                                "QLineEdit { background: #1e3a5f; color: #f8fafc; "
+                                "border: 2px solid #60a5fa; border-radius: 8px; padding: 10px 14px; }"
+                            )
+                            return
+                    event.ignore()
+
+                def dragEnterEvent(self, event) -> None:  # type: ignore[override]
+                    self.customDragEnterEvent(event)
+
+                def dragLeaveEvent(self, event) -> None:  # type: ignore[override]
+                    self.setStyleSheet(
+                        "QLineEdit { background: #1e293b; color: #f8fafc; "
+                        "border: 1px solid #475569; border-radius: 8px; padding: 10px 14px; }"
+                        "QLineEdit:focus { border: 2px solid #3b82f6; }"
+                    )
+
+                def customDropEvent(self, event) -> None:  # type: ignore[override]
+                    if event.mimeData().hasText():
+                        inject = event.mimeData().text()
+                        current = self.text()
+                        # Prepend the inject; keep any existing text the user has typed
+                        separator = " " if current and not current.startswith(" ") else ""
+                        self.setText(inject + separator + current)
+                        self.setCursorPosition(len(self.text()))
+                        event.acceptProposedAction()
+                    self.dragLeaveEvent(event)  # reset highlight
+
+                def dropEvent(self, event) -> None:  # type: ignore[override]
+                    self.customDropEvent(event)
+
+            self.input_line = DragDropLineEdit()
+            self.input_line.setAcceptDrops(True)
+            self.input_line.setPlaceholderText("Ask Atlas anything...")
+            self.input_line.setMinimumHeight(40)
+            self.input_line.returnPressed.connect(self.on_send)
+            self.send_button = QPushButton("Send")
+            self.send_button.setMinimumHeight(40)
+            self.send_button.setMaximumWidth(80)
+            self.send_button.clicked.connect(self.on_send)
+            input_field_layout.addWidget(self.input_line)
+            input_field_layout.addWidget(self.send_button)
+            
+            self.status_label = QLabel("")
+            self.status_label.setStyleSheet("color: #64748b; font-size: 12px; margin-left: 4px;")
+            
+            input_layout.addLayout(input_field_layout)
+            input_layout.addWidget(self.status_label)
+
+            outer_layout.addWidget(self.scroll_area)
+            outer_layout.addWidget(input_widget)
+
+        def _append_chat(self, role: str, text: str, details: str = "") -> None:
+            bubble = ChatBubble(self.assistant, role, text, details)
+            self.chat_layout.insertWidget(self.chat_layout.count() - 1, bubble)
             QTimer.singleShot(50, self._scroll_to_bottom)
 
         def _scroll_to_bottom(self) -> None:
             self.scroll_area.verticalScrollBar().setValue(
                 self.scroll_area.verticalScrollBar().maximum()
             )
-        def open_memory_hub(self):
-            self.hub_window = MemoryManagerWindow(self.assistant, self)
-            self.hub_window.exec()
-
-        def _clear_chat_view(self) -> None:
-            while self.chat_layout.count() > 1:
-                item = self.chat_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-
-        def _refresh_chat_list(self) -> None:
-            while self.chat_list_layout.count() > 1:
-                item = self.chat_list_layout.takeAt(0)
-                if item.widget():
-                    item.widget().deleteLater()
-            if not os.path.isdir(CHAT_LOG_DIR):
-                return
-            files = sorted([f for f in os.listdir(CHAT_LOG_DIR) if f.endswith(".jsonl")], reverse=True)
-            for filename in files[:30]:
-                name = os.path.splitext(filename)[0].replace("_", " ")
-                btn = QPushButton(name[:32])
-                btn.setStyleSheet(
-                    "QPushButton { background: transparent; color: #9ca3af; border: none;"
-                    "border-radius: 6px; padding: 8px 10px; text-align: left; font-size: 13px; }"
-                    "QPushButton:hover { background: #374151; color: #f9fafb; }"
-                )
-                path = os.path.join(CHAT_LOG_DIR, filename)
-                btn.clicked.connect(lambda _, p=path: self._load_chat_from_path(p))
-                self.chat_list_layout.insertWidget(self.chat_list_layout.count() - 1, btn)
-
-        def _load_chat_from_path(self, path: str) -> None:
-            response = self.assistant.load_chat_history_file(path)
-            self._clear_chat_view()
-            for entry in self.assistant.history:
-                role = "Atlas" if entry.get("role") == "assistant" else "You"
-                self._append_message(role, entry.get("message", ""))
-            self._append_message("Atlas", response)
 
         def _append_debug(self, text: str) -> None:
-            if hasattr(self, "debug_text"):
+            if hasattr(self, 'debug_text') and self.debug_text is not None:
                 self.debug_text.append(text)
 
-        def _toggle_debug(self, checked: bool) -> None:
-            self.debug_dialog.show() if checked else self.debug_dialog.hide()
+        def _toggle_debug_panel(self, checked: bool) -> None:
+            if checked:
+                self.debug_dialog.show()
+            else:
+                self.debug_dialog.hide()
 
-        def _on_load_model_dialog(self) -> None:
+        def _toggle_memory_panel(self, checked: bool) -> None:
+            if checked:
+                if self._memory_insight_window is None:
+                    self._memory_insight_window = MemoryInsightWindow(self.assistant, parent=None)
+                    self._memory_insight_window.destroyed.connect(
+                        lambda: setattr(self, "_memory_insight_window", None)
+                    )
+                self._memory_insight_window.populate()
+                self._memory_insight_window.show()
+                self._memory_insight_window.raise_()
+            else:
+                if self._memory_insight_window is not None:
+                    self._memory_insight_window.hide()
+
+        def _on_load_model(self) -> None:
             path, _ = QFileDialog.getOpenFileName(
-                self, "Select GGUF Model", MODEL_SEARCH_DIR, "GGUF Files (*.gguf);;All Files (*)"
+                self,
+                "Select GGUF Model",
+                MODEL_SEARCH_DIR,
+                "GGUF Files (*.gguf);;All Files (*)",
             )
             if not path:
                 return
             response = self.assistant.load_model(path)
-            self.model_label.setText(os.path.basename(path)[:28])
-            self._populate_model_menu()
-            self._append_message("Atlas", response)
+            self._append_chat("Atlas", response)
             self.assistant.history.append({"role": "assistant", "message": response})
             self.assistant.save_chat_history()
-
-        def _populate_model_menu(self) -> None:
-            self.model_menu.clear()
-            unload = QAction("Unload model", self)
-            unload.triggered.connect(self._on_unload_model)
-            self.model_menu.addAction(unload)
-            self.model_menu.addSeparator()
-            try:
-                models = find_gguf_models()
-            except Exception:
-                models = []
-            for mp in models:
-                a = QAction(os.path.basename(mp), self)
-                a.triggered.connect(lambda _, p=mp: self._on_select_model(p))
-                self.model_menu.addAction(a)
-            if models:
-                self.model_menu.addSeparator()
-            refresh = QAction("Refresh", self)
-            refresh.triggered.connect(self._populate_model_menu)
-            self.model_menu.addAction(refresh)
 
         def _on_unload_model(self) -> None:
             self.assistant.llm = None
             self.assistant.model_path = None
             import gc; gc.collect()
-            self.model_label.setText("No model loaded")
-            msg = "Model unloaded."
-            self._append_message("Atlas", msg)
-            self.assistant.history.append({"role": "assistant", "message": msg})
+            self.assistant.gpu_layers = 0
+            response = "No model loaded. Atlas is now in no-model mode."
+            self._append_chat("Atlas", response)
+            self.assistant.history.append({"role": "assistant", "message": response})
             self.assistant.save_chat_history()
 
         def _on_select_model(self, model_path: str) -> None:
             response = self.assistant.load_model(model_path)
-            self.model_label.setText(os.path.basename(model_path)[:28])
-            self._populate_model_menu()
-            self._append_message("Atlas", response)
+            self._append_chat("Atlas", response)
             self.assistant.history.append({"role": "assistant", "message": response})
             self.assistant.save_chat_history()
+
+        def _populate_model_menu(self) -> None:
+            self.model_menu.clear()
+            unload_action = QAction("Unload model / no model", self)
+            unload_action.triggered.connect(self._on_unload_model)
+            self.model_menu.addAction(unload_action)
+            self.model_menu.addSeparator()
+            try:
+                models = find_gguf_models()
+            except Exception:
+                models = []
+
+            if not models:
+                action = QAction("No models found", self)
+                action.setEnabled(False)
+                self.model_menu.addAction(action)
+            else:
+                for model_path in models:
+                    model_name = os.path.basename(model_path)
+                    action = QAction(model_name, self)
+                    action.setData(model_path)
+                    action.triggered.connect(lambda checked, p=model_path: self._on_select_model(p))
+                    self.model_menu.addAction(action)
+                self.model_menu.addSeparator()
+                refresh_action = QAction("Refresh models", self)
+                refresh_action.triggered.connect(self._populate_model_menu)
+                self.model_menu.addAction(refresh_action)
 
         def _on_save_chat_as(self) -> None:
             name, ok = QInputDialog.getText(self, "Save Chat As", "Enter chat name (1-3 words):")
             if not ok or not name.strip():
                 return
             response = self.assistant.save_chat_history(name.strip())
-            self._append_message("Atlas", response)
+            self._append_chat("Atlas", response)
             self.assistant.history.append({"role": "assistant", "message": response})
-            self._refresh_chat_list()
 
-        def _on_load_chat(self) -> None:
-            os.makedirs(CHAT_LOG_DIR, exist_ok=True)
-            path, _ = QFileDialog.getOpenFileName(
-                self, "Load Chat", CHAT_LOG_DIR, "Chat Files (*.jsonl);;All Files (*)"
-            )
-            if not path:
-                return
-            self._load_chat_from_path(path)
-            self._refresh_chat_list()
+        def _on_save_chat(self) -> None:
+            response = self.assistant.save_chat_history()
+            self._append_chat("Atlas", response)
+            self.assistant.history.append({"role": "assistant", "message": response})
+
+        def _clear_chat_view(self) -> None:
+            while self.chat_layout.count():
+                item = self.chat_layout.takeAt(0)
+                widget = item.widget()
+                if widget is not None:
+                    widget.deleteLater()
+            self.chat_layout.addStretch()
 
         def _on_new_chat(self) -> None:
             if self.assistant.history:
@@ -2080,34 +2160,50 @@ if _HAS_QT:
                     self.assistant.save_chat_history()
                 except Exception:
                     pass
+
             self.assistant.history = []
             self.assistant.chat_filename = None
             self._clear_chat_view()
-            self._append_message("Atlas", "New chat started. What's on your mind?")
-            self.status_label.setText("")
-            self._refresh_chat_list()
+            self._append_chat("Atlas", "Started a new chat.")
+            self.status_label.setText("New chat ready")
+
+        def _on_load_chat(self) -> None:
+            os.makedirs(CHAT_LOG_DIR, exist_ok=True)
+            path, _ = QFileDialog.getOpenFileName(
+                self,
+                "Load Saved Chat",
+                CHAT_LOG_DIR,
+                "Chat Files (*.jsonl);;All Files (*)",
+            )
+            if not path:
+                return
+            response = self.assistant.load_chat_history_file(path)
+            self._append_chat("Atlas", response)
+            self.assistant.history.append({"role": "assistant", "message": response})
 
         def on_send(self) -> None:
             user_text = self.input_line.text().strip()
             if not user_text:
                 return
-            self._append_message("You", user_text)
+
+            self._append_chat("You", user_text)
+            self.current_user_text = user_text
             self.assistant.history.append({"role": "user", "message": user_text})
             self.input_line.clear()
-            self.status_label.setText("Atlas is thinking…")
+            self.status_label.setText("Thinking...")
             self.send_button.setEnabled(False)
             QApplication.processEvents()
 
             command_response = self.assistant.handle_command(user_text)
             if command_response is not None:
-                self._append_message("Atlas", command_response)
+                self._append_chat("Atlas", command_response)
                 self.assistant.history.append({"role": "assistant", "message": command_response})
                 self.assistant.save_chat_history()
                 self.send_button.setEnabled(True)
                 self.status_label.setText("")
                 return
 
-            self._append_debug(f"[DEBUG] User: {user_text}\n")
+            self._append_debug(f"[DEBUG] User input: {user_text}\n")
             self.worker = ResponseThread(self.assistant, user_text)
             self.worker.result_ready.connect(self._on_response_ready)
             self.worker.error_occurred.connect(self._on_response_error)
@@ -2116,19 +2212,18 @@ if _HAS_QT:
         def _on_response_ready(self, answer: str, details: str) -> None:
             self.assistant.history.append({"role": "assistant", "message": answer})
             self.assistant.save_chat_history()
-            self._append_message("Atlas", answer, details)
-            self._append_debug(f"[DEBUG] Prompt:\n{self.assistant.last_prompt}\n")
-            self._append_debug(f"[DEBUG] Raw:\n{self.assistant.last_raw_response}\n")
+            self._append_chat("Atlas", answer, details)
+            if self.assistant.last_prompt:
+                self._append_debug(f"[DEBUG] Prompt sent:\n{self.assistant.last_prompt}\n")
+            if self.assistant.last_raw_response:
+                self._append_debug(f"[DEBUG] Raw model response:\n{self.assistant.last_raw_response}\n")
             self.send_button.setEnabled(True)
             self.status_label.setText("")
-            self._refresh_chat_list()
 
         def _on_response_error(self, error_message: str) -> None:
-            self._append_message("Atlas", f"Error: {error_message}")
+            self._append_chat("Atlas", f"Error: {error_message}")
             self.send_button.setEnabled(True)
             self.status_label.setText("")
-
-
 
 
 def select_model(models: List[str], fallback: Optional[str] = None) -> str:
